@@ -1838,15 +1838,13 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": "Content for the file. Required for 'write_file'."
             },
-            "absorbed_into": {
-                "type": "string",
-                "description": (
-                    "For 'delete': declares intent for the curator. Pass the "
-                    "umbrella skill name when this skill's content was merged "
-                    "into another (target must already exist — create/patch it "
-                    "first), or '' for a plain prune with no forwarding target."
-                )
-            },
+            # NOTE: the handler also accepts `absorbed_into` on delete — the
+            # curator's consolidation pass declares merge-vs-prune intent with
+            # it. Deliberately NOT advertised in this schema: only curator
+            # sessions need it, the curator's own prompt documents it, and the
+            # curator-context delete guard's error re-teaches it on omission
+            # (_curator_consolidation_delete_guard). Keeping it out saves
+            # ~100 tokens on every call of every other session.
         },
         "required": ["action", "name"],
     },
