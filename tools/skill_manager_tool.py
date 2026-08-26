@@ -1631,16 +1631,34 @@ def skill_manage(
         result = _create_skill(name, content, category)
 
     elif action == "edit":
+        # Legacy alias for a full rewrite (kept for old transcripts/callers;
+        # no longer advertised in the schema — use patch with `content`).
         if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            return tool_error("content is required for a full rewrite. Provide the full updated SKILL.md text.", success=False)
         result = _edit_skill(name, content)
 
     elif action == "patch":
-        if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
-        if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        # Two shapes: old_string/new_string = targeted replacement;
+        # content (alone) = full SKILL.md rewrite (absorbs the old 'edit').
+        if content and (old_string or new_string is not None):
+            return tool_error(
+                "Pass EITHER content (full SKILL.md rewrite) OR "
+                "old_string/new_string (targeted replacement), not both.",
+                success=False,
+            )
+        if content:
+            result = _edit_skill(name, content)
+        else:
+            if not old_string:
+                return tool_error(
+                    "patch needs old_string/new_string for a targeted "
+                    "replacement, or content for a full SKILL.md rewrite "
+                    "(read it first with skill_view()).",
+                    success=False,
+                )
+            if new_string is None:
+                return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
         result = _delete_skill(name, absorbed_into=absorbed_into)
@@ -1747,20 +1765,21 @@ SKILL_MANAGE_SCHEMA = {
         "Create, update, or delete skills — your procedural memory for "
         "recurring task types. Actions: create (full SKILL.md + optional "
         f"category; lands in {display_hermes_home()}/skills/), patch "
-        "(old_string/new_string — preferred for fixes), edit (full rewrite — "
-        "major overhauls only), delete, write_file/remove_file (supporting "
-        "files). Existing skills are modified wherever they live. Good "
-        "skills: a self-contained trigger in the description's first 57 "
-        "chars ('Use when <trigger>. <one-line behavior>.'), numbered steps "
-        "with exact commands, pitfalls, verification (see skill_view() for "
-        "format). Confirm with the user before create/delete."
+        "(old_string/new_string for a targeted fix — preferred; OR content "
+        "alone for a full SKILL.md rewrite), delete, write_file/remove_file "
+        "(supporting files). Existing skills are modified wherever they "
+        "live. Good skills: a self-contained trigger in the description's "
+        "first 57 chars ('Use when <trigger>. <one-line behavior>.'), "
+        "numbered steps with exact commands, pitfalls, verification (see "
+        "skill_view() for format). Confirm with the user before "
+        "create/delete."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["create", "patch", "delete", "write_file", "remove_file"],
                 "description": "The action to perform."
             },
             "name": {
@@ -1774,8 +1793,9 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Full SKILL.md content (YAML frontmatter + markdown body). "
-                    "Required for 'create' and 'edit'. For 'edit', read the skill "
-                    "first with skill_view() and provide the complete updated text."
+                    "Required for 'create'; on 'patch' it performs a full "
+                    "rewrite (major overhauls only — read the skill first with "
+                    "skill_view(), and don't combine with old_string)."
                 )
             },
             "old_string": {
