@@ -306,6 +306,18 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         reply_to_author_name=(raw.get("reply_to") or {}).get("author"),
         reply_to_is_own_message=bool((raw.get("reply_to") or {}).get("is_own", False)),
         media_urls=raw.get("media_urls") or [],
+        # Per-attachment MIME types, parallel to media_urls, from the
+        # connector's rich media[] array. run.py's per-attachment classifiers
+        # (_event_media_type_at) consult media_types[i] FIRST and only fall
+        # back to the message-level type when it's empty — so this mapping is
+        # what lets a relayed image/document/audio attachment route exactly
+        # like its native-adapter equivalent (and what makes a kind:"voice"
+        # attachment STT-eligible). Entries without a mime keep positional
+        # alignment with an empty string.
+        media_types=[
+            (m.get("mime") or "") if isinstance(m, dict) else ""
+            for m in (raw.get("media") or [])
+        ],
         # Surrounding channel/group CONTEXT the connector attached for this
         # addressed turn (design relay-channel-context): a read-only, oldest→
         # newest list of nearby non-addressed messages (Model A pull / Model B
