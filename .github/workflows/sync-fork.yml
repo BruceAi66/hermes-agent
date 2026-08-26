@@ -1,0 +1,71 @@
+name: Sync Fork with Upstream
+
+# 自动把 NousResearch/hermes-agent 的 main 同步到本 fork 的 main。
+# 只合并不覆盖(fast-forward 优先,冲突时保留本地 main 不动并标注)。
+# VPS 本地不自动动——本地执行 `hermes update` 才拉取。
+
+on:
+  schedule:
+    # 每 2 小时检查一次(UTC 02:00/04:00/... 对齐北京时间 10:00-次日 08:00)
+    - cron: '17 */2 * * *'
+  workflow_dispatch:  # 手动触发按钮
+  push:
+    branches: [main] # 本地推了东西也顺手同步一次
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0   # 完整历史,便于 merge
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+
+      - name: Compare and merge
+        id: sync
+        run: |
+          set -e
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          FORK_SHA=$(git rev-parse HEAD)
+          echo "upstream: $UPSTREAM_SHA"
+          echo "fork:      $FORK_SHA"
+
+          if [ "$UPSTREAM_SHA" = "$FORK_SHA" ]; then
+            echo "✓ Already up to date"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 尝试 fast-forward 合并
+          if git merge --ff-only upstream/main 2>/dev/null; then
+            echo "✓ Fast-forwarded to $UPSTREAM_SHA"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            # 有本地 commit 与上游冲突 —— 不自动解决,保留本地 main,推一个说明
+            echo "⚠ Local changes conflict with upstream — leaving local main intact"
+            echo "   Manual action required: merge upstream/main locally"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git merge --abort 2>/dev/null || true
+            exit 0
+          fi
+
+      - name: Push to fork main
+        if: steps.sync.outputs.updated == 'true'
+        run: |
+          git push origin main
+
+      - name: Report sync result
+        if: steps.sync.outputs.conflict == 'true'
+        run: |
+          echo "::warning::Fork is behind upstream with local commits. Manual merge required:"
+          echo "  git fetch upstream && git merge upstream/main"
