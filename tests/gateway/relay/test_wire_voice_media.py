@@ -99,3 +99,78 @@ class TestMediaTypesMapping:
         """Older connectors (no media[]) — byte-identical to pre-fix."""
         ev = _event_from_wire(_wire_event("text"))
         assert ev.media_types == []
+
+    def test_length_mismatch_drops_mimes_rather_than_misaligning(self):
+        """media_urls and media[] are independent wire fields; consumers index
+        BOTH by the same i. A disagreeing producer must not cause a MIME to be
+        attached to the wrong URL (mis-routing) — fail safe to no MIMEs, which
+        degrades to message-level classification."""
+        media = [
+            {"url": "https://x/a.png", "kind": "image", "mime": "image/png"},
+            {"url": "https://x/b.pdf", "kind": "document", "mime": "application/pdf"},
+        ]
+        ev = _event_from_wire(
+            _wire_event("image", media=media, media_urls=["https://x/a.png"])
+        )
+        assert ev.media_types == []
+        assert ev.media_urls == ["https://x/a.png"]
+
+
+class TestSttGate:
+    """Direct assertions on run.py's STT gate against REAL wire-parsed
+    events. The PR's acceptance criterion is STT routing, not object
+    construction — pin the user-visible invariant here.
+
+    Note the deployment-ordering consequence: MessageType.VOICE parses on
+    ANY gateway (the enum predates this PR) and the gate accepts VOICE with
+    empty media_types, so a NEW connector + OLD gateway already fires STT
+    for voice notes. Desirable — but it means the gate's behaviour is part
+    of the wire contract, and it must not silently change."""
+
+    def test_new_connector_voice_event_is_stt_eligible(self):
+        from gateway.run import _event_media_is_stt_input
+
+        ev = _event_from_wire(
+            _wire_event(
+                "voice",
+                media=[{"url": "https://gw/relay/media/x", "kind": "voice", "mime": "audio/ogg"}],
+                media_urls=["https://gw/relay/media/x"],
+            )
+        )
+        assert _event_media_is_stt_input(ev, 0) is True
+
+    def test_voice_event_stt_eligible_even_without_media_types(self):
+        """A new-connector/old-gateway-shaped event — voice type, no
+        media[] — still fires STT (the gate's VOICE branch doesn't consult
+        media_types). Pins the rollout behaviour, not just the new one."""
+        from gateway.run import _event_media_is_stt_input
+
+        ev = _event_from_wire(
+            _wire_event("voice", media_urls=["https://gw/relay/media/x"])
+        )
+        assert ev.media_types == []
+        assert _event_media_is_stt_input(ev, 0) is True
+
+    def test_legacy_audio_typed_voice_note_stays_out_of_stt(self):
+        from gateway.run import _event_media_is_stt_input
+
+        ev = _event_from_wire(
+            _wire_event(
+                "audio",
+                media=[{"url": "https://gw/relay/media/x", "kind": "voice", "mime": "audio/ogg"}],
+                media_urls=["https://gw/relay/media/x"],
+            )
+        )
+        assert _event_media_is_stt_input(ev, 0) is False
+
+    def test_music_upload_is_never_stt_eligible(self):
+        from gateway.run import _event_media_is_stt_input
+
+        ev = _event_from_wire(
+            _wire_event(
+                "audio",
+                media=[{"url": "https://cdn/x/song.mp3", "kind": "audio", "mime": "audio/mpeg"}],
+                media_urls=["https://cdn/x/song.mp3"],
+            )
+        )
+        assert _event_media_is_stt_input(ev, 0) is False

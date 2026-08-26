@@ -209,6 +209,36 @@ def _normalize_slack_parent_command(
     return normalized, normalized_type
 
 
+def _media_types_from_wire(raw: Dict[str, Any]) -> list[str]:
+    """Per-attachment MIME types, positionally aligned with ``media_urls``.
+
+    ``media_urls`` (legacy, flat) and ``media`` (rich, Phase 2) are separate
+    wire fields. The connector builds both from one list, so they agree — but
+    the gateway must not ASSUME that: consumers index the two lists by the
+    same ``i`` (``_event_media_type_at``), so a length disagreement would
+    attach one attachment's MIME to another's URL and mis-route it. That is
+    strictly worse than having no MIME, where classification safely falls
+    back to the message-level type.
+
+    Fail safe: map only when the lengths agree; otherwise return ``[]``.
+    A missing per-entry ``mime`` keeps its slot as ``""``.
+    """
+    media = raw.get("media")
+    if not isinstance(media, list) or not media:
+        return []
+    urls = raw.get("media_urls")
+    if isinstance(urls, list) and len(urls) != len(media):
+        # Disagreeing producer — refuse to guess the pairing.
+        logger.warning(
+            "relay inbound media/media_urls length mismatch (%d vs %d); "
+            "dropping per-attachment MIME types for this event",
+            len(media),
+            len(urls),
+        )
+        return []
+    return [(m.get("mime") or "") if isinstance(m, dict) else "" for m in media]
+
+
 def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
     """Rebuild a MessageEvent from the connector's normalized inbound payload.
 
@@ -314,10 +344,15 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         # like its native-adapter equivalent (and what makes a kind:"voice"
         # attachment STT-eligible). Entries without a mime keep positional
         # alignment with an empty string.
-        media_types=[
-            (m.get("mime") or "") if isinstance(m, dict) else ""
-            for m in (raw.get("media") or [])
-        ],
+        #
+        # media_urls and media[] are independent wire fields. Today's
+        # connector builds both from the same list, but a malformed or
+        # future producer could disagree — and a LENGTH MISMATCH would
+        # silently misassociate a MIME with the wrong URL (worse than no
+        # MIME at all: it mis-routes an attachment). Fail safe: map only
+        # when the two agree, otherwise leave media_types empty and let the
+        # message-level type drive classification (pre-fix behaviour).
+        media_types=_media_types_from_wire(raw),
         # Surrounding channel/group CONTEXT the connector attached for this
         # addressed turn (design relay-channel-context): a read-only, oldest→
         # newest list of nearby non-addressed messages (Model A pull / Model B
