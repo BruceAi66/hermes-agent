@@ -3371,24 +3371,19 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     Installs that can't honor non-default branches (e.g. Docker) surface a
     one-line notice instead of silently dropping the flag.
     """
-    from hermes_cli.config import (
-        detect_install_method,
-        is_nix_install_method,
-        recommended_update_command_for_method,
+    # Shared admission gate (#91277 Phase 3): same marker-first decision as
+    # the apply path, so --check can never report git state for an install
+    # whose real update mechanism is an image pull.
+    from hermes_cli.update_contract import (
+        evaluate_update_admission,
+        record_refusal_receipt,
     )
-    method = detect_install_method(_m().PROJECT_ROOT)
-    if method == "docker":
-        # Docker can't ``git fetch`` from within the container.  Surface the
-        # same long-form ``docker pull`` guidance ``hermes update`` (apply
-        # path) uses — telling the user to "reinstall via curl" or that
-        # ".git is missing" would point them at the wrong remediation.
-        from hermes_cli.config import format_docker_update_message
-        print(format_docker_update_message())
-        sys.exit(1)
 
-    if is_nix_install_method(method) or method == "apt":
-        print(recommended_update_command_for_method(method))
-        sys.exit(1)
+    refusal = evaluate_update_admission(_m().PROJECT_ROOT)
+    if refusal is not None:
+        print(refusal.message)
+        record_refusal_receipt(refusal)
+        sys.exit(2)
 
     git_dir = _m().PROJECT_ROOT / ".git"
     if not git_dir.exists():
@@ -8690,14 +8685,43 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # a moment to rewrite gateway_state.json with their new identity.
             # Skipped when the restart phase touched nothing (no gateways
             # were running) — nothing to settle.
+            #
+            # On Windows the resume path relaunches the gateway DETACHED, and
+            # that process must boot before it stamps gateway_state.json or
+            # answers the control socket (a Telegram gateway reconnects its
+            # polling loop — ~10s).  A single 2s sleep therefore races the
+            # gateway's own startup and reports "no rows" (exit 1) for a
+            # healthy resume, which then triggers a full retry that re-kills
+            # the gateway the first attempt just started.  Poll a bounded
+            # window for the resumed gateway to publish its identity instead.
+            _fleet_snapshot = []
             if _fleet_rows_expected:
-                _time.sleep(2.0)
-            # Pass the pre-restart PID snapshot so a gateway the restart
-            # phase stopped WITHOUT a verified replacement shows as a DOWN
-            # row (exit 1) instead of silently producing no row at all.
-            _fleet_snapshot = collect_fleet_versions(
-                pre_restart_pids=_pre_restart_gateway_pids
-            )
+                _fleet_deadline = _time.monotonic() + 30.0
+                while True:
+                    _time.sleep(2.0)
+                    # Pass the pre-restart PID snapshot so a gateway the
+                    # restart phase stopped WITHOUT a verified replacement
+                    # shows as a DOWN row (exit 1) instead of silently
+                    # producing no row at all.
+                    _fleet_snapshot = collect_fleet_versions(
+                        pre_restart_pids=_pre_restart_gateway_pids
+                    )
+                    # A "down" row here is the stale pre-restart record of a
+                    # gateway whose detached replacement is still booting —
+                    # not a confirmed failure.  Keep polling until every
+                    # resumed gateway has published (no "down" rows remain)
+                    # or the deadline passes, so a slow second gateway can't
+                    # be misread as down and re-trigger the retry loop.
+                    if _fleet_snapshot and not any(
+                        row.get("state") == "down" for row in _fleet_snapshot
+                    ):
+                        break
+                    if _time.monotonic() >= _fleet_deadline:
+                        break
+            else:
+                _fleet_snapshot = collect_fleet_versions(
+                    pre_restart_pids=_pre_restart_gateway_pids
+                )
             if print_fleet_version_matrix(_fleet_snapshot):
                 gateway_fleet_restart_incomplete = True
             elif not _fleet_snapshot and _fleet_rows_expected:
