@@ -631,12 +631,27 @@ def _notify_session_boundary(
         pass
 
 
+_SESSION_OWNERSHIP_UNAVAILABLE = (
+    "Hermes could not safely reserve this session. Try again."
+)
+
+_AUTOMATIC_SESSION_END_REASONS = frozenset({
+    "ws_orphan_reap",
+    "ws_disconnect",
+    "idle_timeout",
+    "lru_evict",
+    "tui_shutdown",
+})
+
+
 def _claim_active_session_slot(
     session_key: str,
     *,
     live_session_id: str,
     surface: str = "tui",
+    profile_home: str | Path | None = None,
 ) -> tuple[Any, str | None]:
+    track_liveness = str(surface or "").strip().lower() == "desktop"
     try:
         from hermes_cli.active_sessions import try_acquire_active_session
 
@@ -645,10 +660,16 @@ def _claim_active_session_slot(
             surface=surface,
             config=_load_cfg(),
             metadata={"live_session_id": live_session_id},
+            registry_home=profile_home,
+            track_liveness=track_liveness,
         )
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
-        return None, None
+        return (
+            (None, _SESSION_OWNERSHIP_UNAVAILABLE)
+            if track_liveness
+            else (None, None)
+        )
 
 
 def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
@@ -671,6 +692,7 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
         str(session.get("session_key") or ""),
         live_session_id=sid,
         surface=_session_source(session),
+        profile_home=session.get("profile_home"),
     )
     if limit_message is not None:
         return limit_message
@@ -678,16 +700,89 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return None
 
 
-def _release_active_session_slot(session: dict | None) -> None:
-    if not session:
-        return
-    lease = session.pop("active_session_lease", None)
+def _release_active_session_lease(lease) -> bool:
     if lease is None:
+        return True
+    attempts = 3 if getattr(lease, "track_liveness", False) else 1
+    for attempt in range(attempts):
+        try:
+            lease.release()
+            break
+        except Exception:
+            if attempt + 1 >= attempts:
+                logger.warning("Failed to release active session slot", exc_info=True)
+                return False
+            time.sleep(0.05 * (attempt + 1))
+    released = getattr(lease, "released", True)
+    enabled = getattr(lease, "enabled", True)
+    return bool(released or not enabled)
+
+
+def _release_active_session_slot(session: dict | None) -> bool:
+    if not session:
+        return True
+    lease = session.get("active_session_lease")
+    if _release_active_session_lease(lease):
+        if session.get("active_session_lease") is lease:
+            session.pop("active_session_lease", None)
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def _other_runtime_lease_guard(session_id: str, session: dict):
+    """Release this runtime and lock sibling ownership through the DB write."""
+    lease = session.get("active_session_lease")
+    try:
+        from hermes_cli.active_sessions import (
+            active_session_liveness_guard,
+            release_active_session_liveness_guard,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to load active session ownership guard; preserving session %s: %s",
+            session_id,
+            exc,
+        )
+        yield True
+        return
+
+    last_error: Exception | None = None
+    stack = contextlib.ExitStack()
+    for attempt in range(3):
+        try:
+            if lease is not None and getattr(lease, "enabled", False):
+                guard = release_active_session_liveness_guard(lease, session_id)
+            else:
+                guard = active_session_liveness_guard(
+                    session_id, registry_home=session.get("profile_home")
+                )
+            active = stack.enter_context(guard)
+            break
+        except Exception as exc:
+            stack.close()
+            stack = contextlib.ExitStack()
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    else:
+        logger.warning(
+            "Failed to inspect active session leases; preserving session %s: %s",
+            session_id,
+            last_error,
+        )
+        yield True
         return
     try:
-        lease.release()
-    except Exception:
-        logger.debug("Failed to release active session slot", exc_info=True)
+        yield active
+    finally:
+        stack.close()
+        if (
+            lease is not None
+            and getattr(lease, "released", False)
+            and session.get("active_session_lease") is lease
+        ):
+            session.pop("active_session_lease", None)
 
 
 def _transfer_active_session_slot(
@@ -713,6 +808,9 @@ def _transfer_active_session_slot(
     except Exception:
         logger.debug("Failed to transfer active session slot", exc_info=True)
 
+    if getattr(lease, "track_liveness", False):
+        return False
+
     # Fallback: the in-place transfer could not move the lease (entry pruned /
     # pid-check transiently failed). Reserve the new slot BEFORE releasing the
     # old one, so a concurrent gateway at the session cap cannot grab the freed
@@ -722,6 +820,7 @@ def _transfer_active_session_slot(
         new_session_id,
         live_session_id=sid,
         surface=_session_source(session),
+        profile_home=session.get("profile_home"),
     )
     if new_lease is not None:
         old_lease = session.pop("active_session_lease", None)
@@ -796,7 +895,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if history_ready is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
         history_ready.set()
-    _release_active_session_slot(session)
+    _desktop_automatic_cleanup = bool(
+        end_reason in _AUTOMATIC_SESSION_END_REASONS
+        and _session_source(session).strip().lower() == "desktop"
+    )
+    # Automatic Desktop cleanup removes its lease inside the lock-held lifecycle
+    # guard below. Explicit close and non-Desktop paths keep force/end semantics.
+    if not _desktop_automatic_cleanup:
+        _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
@@ -864,27 +970,42 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # Use session_id (from agent.session_id) not session_key — after compression,
     # session_key may be stale (the ended parent) while session_id is the live
     # continuation. Fix for #20001.
-    _tui_owns_lifecycle = True
-    if session_id:
-        try:
-            # End the row in the *session's* profile state.db (app-global
-            # remote mode), not the launch profile's shared handle.
-            with _session_db(session) as db:
-                if db is not None:
-                    # Don't end gateway-originated sessions — the gateway owns
-                    # their lifecycle.  The TUI is a viewer, not the owner.
-                    # Ending a gateway session in state.db triggers a Groundhog
-                    # Day routing loop: the gateway's #54878 self-heal detects
-                    # the stale entry, recovers to the parent session, context
-                    # compression splits back to the reaped child, and the cycle
-                    # repeats on every inbound message.  (#60609)
-                    row = db.get_session(session_id)
-                    source = (row or {}).get("source", "")
-                    _tui_owns_lifecycle = not _is_gateway_owned_source(source)
-                    if _tui_owns_lifecycle:
-                        db.end_session(session_id, end_reason)
-        except Exception:
-            pass
+    if _desktop_automatic_cleanup and not session_id:
+        _release_active_session_slot(session)
+    _lifecycle_guard = (
+        _other_runtime_lease_guard(session_id, session)
+        if _desktop_automatic_cleanup and session_id
+        else contextlib.nullcontext(False)
+    )
+    with _lifecycle_guard as _other_runtime_owns_lifecycle:
+        _tui_owns_lifecycle = not _other_runtime_owns_lifecycle
+        if _other_runtime_owns_lifecycle:
+            logger.info(
+                "Preserving session %s during %s: another backend owns an active lease",
+                session_id,
+                end_reason,
+            )
+        if session_id:
+            try:
+                # End the row in the *session's* profile state.db (app-global
+                # remote mode), not the launch profile's shared handle.
+                with _session_db(session) as db:
+                    if db is not None:
+                        # Don't end gateway-originated sessions — the gateway owns
+                        # their lifecycle.  The TUI is a viewer, not the owner.
+                        # Ending a gateway session in state.db triggers a Groundhog
+                        # Day routing loop: the gateway's #54878 self-heal detects
+                        # the stale entry, recovers to the parent session, context
+                        # compression splits back to the reaped child, and the cycle
+                        # repeats on every inbound message.  (#60609)
+                        row = db.get_session(session_id)
+                        source = (row or {}).get("source", "")
+                        if _is_gateway_owned_source(source):
+                            _tui_owns_lifecycle = False
+                        elif _tui_owns_lifecycle:
+                            db.end_session(session_id, end_reason)
+            except Exception:
+                pass
 
     # A session's in-flight async delegations end WITH the session (#55578):
     # once nobody owns the return address, a still-running background subagent
@@ -1881,6 +2002,13 @@ def _sweep_orphaned_session_rows() -> list[str]:
     process still holds in memory (e.g. a ``session.resume`` during the
     startup grace window) are excluded so the sweep never races a
     mid-reconnect client.
+
+    Cross-backend liveness (#94895): when one ``state.db`` is shared by
+    N serve / gateway processes, each registered a heartbeat row in
+    ``gateway_heartbeats``. The sweep refuses to close a row that any
+    live backend (heartbeat refreshed within ``2 * TTL``) could
+    plausibly own — see ``SessionDB.sweep_orphaned_sessions`` for the
+    exact predicate.
     """
     db = _get_db()
     if db is None:
@@ -1901,6 +2029,138 @@ def _sweep_orphaned_session_rows() -> list[str]:
             ", ".join(swept),
         )
     return swept
+
+
+# ── Cross-backend heartbeat (#94895) ───────────────────────────────────
+# Each serve / gateway process registers a heartbeat row in
+# ``gateway_heartbeats`` so the startup orphan sweep can tell "row owned
+# by a live but idle backend" from "row truly orphaned".  Without this,
+# the first process to restart in a multi-backend topology reaped every
+# inactive row — including those held by the other N−1 still-running
+# processes (the #94895 reporter saw 473 sessions disappear in one shot).
+#
+# Refresh cadence: every HEARTBEAT_REFRESH_S (default 60s — much shorter
+# than the default 6h session TTL so a refresh always lands inside the
+# staleness window).  The heartbeat is removed at process exit so a
+# graceful shutdown doesn't leave a stale row behind.  A crashed process
+# leaves its row until the heartbeat ages out of the staleness window,
+# at which point the sweep treats it as dead.
+
+_HEARTBEAT_REFRESH_S = float(
+    os.environ.get("HERMES_GATEWAY_HEARTBEAT_REFRESH_S") or 60.0
+)
+_HEARTBEAT_REFRESH_S = max(0.0, _HEARTBEAT_REFRESH_S)
+
+_heartbeat_refresher_started = False
+_heartbeat_refresher_lock = threading.Lock()
+
+
+def _backend_id_for_this_process() -> str:
+    """Stable identity for this process's heartbeat row (#94895).
+
+    Includes pid AND a startup-time nonce so a PID-reuse respawn cannot
+    inherit the dead predecessor's heartbeat and protect truly orphaned
+    sessions.  The pid is kept for human readability in diagnostics.
+    """
+    nonce = getattr(_backend_id_for_this_process, "_nonce", None)
+    if nonce is None:
+        import secrets as _secrets
+
+        nonce = _secrets.token_hex(4)
+        try:
+            setattr(_backend_id_for_this_process, "_nonce", nonce)
+        except AttributeError:  # pragma: no cover - defensive
+            pass
+    return f"{_current_profile_name()}@{os.uname().nodename if hasattr(os, 'uname') else 'host'}:{os.getpid()}:{nonce}"
+
+
+def _refresh_backend_heartbeat() -> None:
+    """Refresh this backend's heartbeat row (#94895). No-op when DB unavailable."""
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        db.register_backend_heartbeat(
+            backend_id=_backend_id_for_this_process(),
+            pid=os.getpid(),
+            started_at=_gateway_started_at(),
+            profile=_current_profile_name(),
+            host=(os.uname().nodename if hasattr(os, "uname") else "host"),
+        )
+    except Exception:
+        logger.debug("backend heartbeat refresh failed", exc_info=True)
+
+
+def _gateway_started_at() -> float:
+    """Wall-clock time when this process started. Module-import time is
+    a good-enough proxy: the heartbeat refresher runs after the gateway
+    is fully wired up.
+    """
+    started = getattr(_gateway_started_at, "_t", None)
+    if started is None:
+        started = time.time()
+        try:
+            setattr(_gateway_started_at, "_t", started)
+        except AttributeError:  # pragma: no cover
+            pass
+    return started
+
+
+def _heartbeat_refresher_loop(stop_event: threading.Event) -> None:
+    """Background loop that refreshes the heartbeat on a fixed cadence."""
+    while not stop_event.is_set():
+        try:
+            _refresh_backend_heartbeat()
+        except Exception:
+            logger.debug("heartbeat refresh loop iteration failed", exc_info=True)
+        stop_event.wait(_HEARTBEAT_REFRESH_S)
+
+
+def _start_backend_heartbeat_refresher() -> None:
+    """Register this backend and start the refresher thread (#94895).
+
+    Called once per process from both gateway entry points.  The first
+    refresh writes the row immediately so even a very fast crash leaves
+    a fresh-enough row that other backends can see.  Repeat calls are
+    no-ops.  The refresher thread is only spawned when
+    ``_HEARTBEAT_REFRESH_S > 0`` — a refresh interval of zero means
+    "register the row once, never refresh" (the row ages out naturally
+    after the heartbeat staleness window).
+    """
+    global _heartbeat_refresher_started
+    with _heartbeat_refresher_lock:
+        if _heartbeat_refresher_started:
+            return
+        _heartbeat_refresher_started = True
+    # Write a row synchronously so the sweep run later in this same
+    # process can see ourselves in the heartbeat table too.  Without
+    # this, exclude_ids would have to cover every local session — a
+    # regression in the strict-ownership case the heartbeat exists to fix.
+    try:
+        _refresh_backend_heartbeat()
+    except Exception:
+        logger.debug("initial backend heartbeat write failed", exc_info=True)
+    if _HEARTBEAT_REFRESH_S <= 0:
+        return
+    stop_event = threading.Event()
+
+    def _atexit_clear():
+        stop_event.set()
+        try:
+            db = _get_db()
+            if db is not None:
+                db.clear_backend_heartbeat(_backend_id_for_this_process())
+        except Exception:
+            pass
+
+    atexit.register(_atexit_clear)
+    thread = threading.Thread(
+        target=_heartbeat_refresher_loop,
+        args=(stop_event,),
+        name="hermes-gateway-heartbeat",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _schedule_startup_orphan_sweep() -> None:
@@ -2965,7 +3225,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
                 resume_overrides = current.get("resume_runtime_overrides")
-                if isinstance(resume_overrides, dict) and resume_overrides:
+                if (
+                    isinstance(resume_overrides, dict)
+                    and resume_overrides
+                    and _overrides_have_routable_provider(resume_overrides)
+                ):
                     # Cold deferred resume: restore the full persisted runtime
                     # identity (model/provider/base_url/api_mode/reasoning/tier)
                     # exactly as the eager resume path's _stored_session_runtime_
@@ -2973,9 +3237,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # provider and fail with "No LLM provider configured".
                     kw.update(resume_overrides)
                 else:
-                    # Model/effort/fast the desktop picked for a brand-new chat
-                    # ride in as per-session overrides so the first build uses
-                    # them directly (no global config, no build-then-switch).
+                    # No stored runtime, or the stored provider no longer
+                    # resolves (renamed/removed since the row was written) —
+                    # never let that sink agent init with "Unknown provider".
+                    # Fall back to the model/effort/fast the desktop picked
+                    # for THIS session, else the configured default.
                     if override := current.get("model_override"):
                         kw["model_override"] = override
                     if (reasoning := current.get("create_reasoning_override")) is not None:
@@ -3623,6 +3889,23 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    # Bot-Mode room plumbing sessions are per-member scratch conversations
+    # inside a group chat: their runtime must ALWAYS follow the member profile's
+    # CURRENT config, never the provider that was pinned when the row was first
+    # written. Persist that contract explicitly so resume can distinguish room
+    # plumbing from a normal user chat (whose stored model/provider must be
+    # restored verbatim). See _stored_session_runtime_overrides.
+    if session.get("room_plumbing"):
+        model_config["room_plumbing"] = True
+    # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
+    # sessions are plugin-owned scratch conversations: their runtime must ALWAYS
+    # follow the member profile's CURRENT config, never the model/provider that
+    # was pinned when the row was first written. Persist that contract explicitly
+    # so resume can distinguish them from a normal user chat (whose stored
+    # model/provider must be restored verbatim). See
+    # _stored_session_runtime_overrides.
+    if session.get("follow_profile_config"):
+        model_config["follow_profile_config"] = True
     try:
         db.create_session(
             key,
@@ -4942,6 +5225,30 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 from hermes_state import _BARE_BILLING_PROVIDERS
 
 
+def _overrides_have_routable_provider(overrides: dict) -> bool:
+    """Whether persisted runtime overrides still name a routable provider.
+
+    A session row written under a provider that has since been renamed or
+    removed would otherwise fail agent init with "Unknown provider".
+    Empty provider counts as NOT routable here, so the caller falls back
+    to the model the user picked for this session / the configured
+    default instead of restoring a provider-less snapshot override.
+    """
+    provider = str(overrides.get("provider_override") or "").strip()
+    if not provider:
+        provider = str(
+            (overrides.get("model_override") or {}).get("provider") or ""
+        ).strip()
+    if not provider:
+        return False
+    try:
+        from hermes_cli.runtime_provider import is_routable_provider
+
+        return is_routable_provider(provider)
+    except Exception:
+        return False
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -4952,6 +5259,74 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     ``billing_provider``, and richer runtime knobs in JSON ``model_config``.
     """
     if not row:
+        return {}
+
+    # Bot-Mode room plumbing sessions (hidden, titled "Group: <name>") are
+    # per-member scratch conversations inside a group chat. They must always
+    # rebuild from the member profile's CURRENT config: restoring the stored
+    # model/provider pin from an old row is what left room bots stuck on
+    # Nous (or any earlier provider) long after the profile was switched —
+    # every room message then failed with "out of Nous credits" while the
+    # same bots worked fine in DMs. 1:1 chats keep the stored-runtime
+    # restore (opening an older chat must show the model it actually used);
+    # only the room plumbing is exempt.
+    #
+    # The primary signal is the EXPLICIT ``room_plumbing`` contract persisted
+    # by session.create/room consumers (desktop Bot Mode) — a deliberate
+    # marker, not a presentation heuristic. The hidden + "Group:" title
+    # shape is kept as a legacy fallback so rows created by older desktop
+    # builds (which never sent the marker) still behave correctly until the
+    # client catches up.
+    raw_plumbing = row.get("model_config")
+    if isinstance(raw_plumbing, dict):
+        _plumbing_marker = raw_plumbing.get("room_plumbing")
+    elif isinstance(raw_plumbing, str) and raw_plumbing.strip():
+        try:
+            _plumbing_marker = json.loads(raw_plumbing).get("room_plumbing")
+        except Exception:
+            _plumbing_marker = None
+    else:
+        _plumbing_marker = None
+    if _plumbing_marker:
+        return {}
+    _row_title = str(row.get("title") or "").strip()
+    _row_hidden = row.get("hidden")
+    if _row_hidden and _row_title.startswith("Group:"):
+        return {}
+
+    # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
+    # sessions are plugin-owned scratch conversations. They must always rebuild
+    # from the member profile's CURRENT config: restoring the stored
+    # model/provider pin from an old row is what left bot DMs stuck on a stale
+    # provider (e.g. "out of Nous credits" after the profile was switched to
+    # ollama-cloud) while the same bot worked fine in rooms. 1:1 user chats
+    # keep the stored-runtime restore (opening an older chat must show the
+    # model it actually used); only the plugin-owned bot sessions are exempt.
+    #
+    # The primary signal is the EXPLICIT ``follow_profile_config`` contract
+    # persisted by session.create consumers (desktop Bot Mode) — a deliberate
+    # marker, not a presentation heuristic.
+    raw_follow = row.get("model_config")
+    if isinstance(raw_follow, dict):
+        _follow_marker = raw_follow.get("follow_profile_config")
+    elif isinstance(raw_follow, str) and raw_follow.strip():
+        try:
+            _follow_marker = json.loads(raw_follow).get("follow_profile_config")
+        except Exception:
+            _follow_marker = None
+    else:
+        _follow_marker = None
+    if _follow_marker:
+        return {}
+    # Legacy backfill: canonical Bot Chats created BEFORE the
+    # follow_profile_config contract existed carry no marker, yet they are
+    # still the plugin-owned forever-DM. The plugin's own identity rule is
+    # "the profile's session titled exactly 'Bot Chat'" (UNIQUE(title) makes
+    # that an exact registry, and pre-policy rows may be visible OR hidden),
+    # so mirror that rule here. Without this, every Bot Chat that already
+    # exists in the field stays pinned to its stale stored provider until
+    # the user deletes it — the exact live-report shape (#89497 / #94818).
+    if _row_title == "Bot Chat":
         return {}
 
     raw_config = row.get("model_config")
@@ -4985,30 +5360,46 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
-    # Heal a bare ``"custom"`` provider stored by an older build (or any leak
-    # site that bypassed _runtime_model_config's normalization). Bare custom is
-    # the resolved billing class, not a routable identity — restoring it as the
-    # session's provider override routes the resume to the OpenRouter default
-    # URL with no api_key, surfacing as "No LLM provider configured". Recover
-    # the durable ``custom:<name>`` menu key from the stored base_url, then
-    # from the entry that serves the stored model, falling back to the
-    # configured provider when the row has neither (the recurring Desktop/TUI
-    # regression vector). If none names a real entry,
-    # drop the bare provider entirely so resume falls back to the configured
-    # default rather than the broken OpenRouter route.
-    if provider.strip().lower() == "custom":
-        healed = None
+    # Heal a stale/expired provider name persisted by an older build — not
+    # just the bare ``"custom"`` billing class. A renamed or removed custom
+    # provider (e.g. ``oldone`` -> ``newone``) stored in the session row
+    # would otherwise fail agent init with "Unknown provider '<name>'".
+    # Recover the durable ``custom:<name>`` menu key from the stored
+    # base_url, then from the entry that serves the stored model, falling
+    # back to the configured provider when the row has neither. When
+    # nothing names a real entry, drop the provider entirely so resume
+    # falls back to the configured default rather than the broken route.
+    if provider:
+        routable = False
         try:
-            from hermes_cli.runtime_provider import canonical_custom_identity
+            from hermes_cli.runtime_provider import is_routable_provider
 
-            healed = canonical_custom_identity(
-                base_url=base_url or None, model=model or None
-            )
+            routable = is_routable_provider(provider)
         except Exception:
-            logger.debug(
-                "custom provider identity recovery failed", exc_info=True
-            )
-        provider = healed or ("" if not base_url else provider)
+            routable = False
+        if not routable:
+            healed = None
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+
+                healed = canonical_custom_identity(
+                    base_url=base_url or None, model=model or None
+                )
+            except Exception:
+                logger.debug(
+                    "custom provider identity recovery failed", exc_info=True
+                )
+            if healed:
+                logger.info(
+                    "healed stale session provider %r to %r", provider, healed
+                )
+                provider = healed
+                # The healed identity owns a registered endpoint; drop the
+                # snapshot's base_url so it can't override the registry URL
+                # (e.g. a stale direct endpoint behind a renamed proxy).
+                base_url = ""
+            else:
+                provider = ""
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -5037,6 +5428,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
 
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+    """Merge the agent's CURRENT runtime identity onto an existing config.
+
+    ``existing`` is the row's previously-persisted ``model_config`` JSON (may
+    be absent on first write). The returned dict must mirror the agent's live
+    state: falsy agent attributes DELETE the corresponding key rather than
+    merely omit the write, so a stale value from an earlier session state can
+    never survive into the merged config. Keeping stale values here is what
+    desynced the ``sessions.model`` column (fresh) from ``model_config``
+    (stale provider/endpoint): ``_persist_live_session_runtime`` writes the
+    model column separately, and on resume ``_stored_session_runtime_overrides``
+    reads provider/endpoint from this JSON — so a stale provider would silently
+    route the resumed chat to the wrong endpoint while the model column claimed
+    the new one.
+    """
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
@@ -5047,6 +5452,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
 
     if model:
         config["model"] = model
+    else:
+        config.pop("model", None)
     if provider:
         if provider.strip().lower() == "custom":
             # ``agent.provider`` is the RESOLVED provider, and for any named
@@ -5077,6 +5484,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
                     "custom provider identity lookup failed", exc_info=True
                 )
         config["provider"] = provider
+    else:
+        config.pop("provider", None)
     if base_url:
         config["base_url"] = base_url
     else:
@@ -5726,6 +6135,55 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+
+
+@contextlib.contextmanager
+def _session_profile_runtime_scope(session: dict):
+    """Bind model resolution to the session's profile config and secrets."""
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        yield
+        return
+    home_token = set_hermes_home_override(profile_home)
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _restart_completed_failed_agent_build(
+    sid: str, session: dict, failed_ready: threading.Event | None
+) -> bool:
+    """Replace one completed failed build generation and start its retry."""
+    if failed_ready is None:
+        return False
+    build_lock = session.setdefault("agent_build_lock", threading.Lock())
+    with build_lock:
+        if (
+            session.get("agent") is not None
+            or session.get("agent_error") is None
+            or session.get("agent_ready") is not failed_ready
+            or not failed_ready.is_set()
+        ):
+            return False
+        model_override = session.get("model_override")
+        resume_overrides = session.get("resume_runtime_overrides")
+        if isinstance(model_override, dict) and isinstance(resume_overrides, dict):
+            resume_overrides = dict(resume_overrides)
+            resume_overrides["model_override"] = model_override
+            if provider := model_override.get("provider"):
+                resume_overrides["provider_override"] = provider
+            else:
+                resume_overrides.pop("provider_override", None)
+            session["resume_runtime_overrides"] = resume_overrides
+        session["agent_error"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session.pop("_agent_build_thread", None)
+    _start_agent_build(sid, session)
+    return True
 
 
 def _apply_model_switch(
@@ -13330,7 +13788,33 @@ def _(rid, params: dict) -> dict:
                     )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
+                failed_agent_init = (
+                    session.get("agent") is None
+                    and session.get("agent_error") is not None
+                )
+                failed_ready = session.get("agent_ready") if failed_agent_init else None
+                if failed_agent_init:
+                    if failed_ready is None:
+                        return _err(
+                            rid,
+                            5032,
+                            session.get("agent_error")
+                            or "agent initialization failed",
+                        )
+                    if not failed_ready.wait(timeout=30.0):
+                        return _err(rid, 5032, "agent initialization timed out")
+                failed_agent_init = (
+                    failed_agent_init
+                    and session.get("agent") is None
+                    and session.get("agent_error") is not None
+                    and session.get("agent_ready") is failed_ready
+                    and failed_ready.is_set()
+                )
+                if (
+                    session.get("agent") is None
+                    and not explicit_provider.strip()
+                    and not failed_agent_init
+                ):
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
                     init_err = _wait_agent(session, rid)
@@ -13338,15 +13822,27 @@ def _(rid, params: dict) -> dict:
                         return init_err
                     if session.get("agent") is None:
                         return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
+                with _session_profile_runtime_scope(session):
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
+                if failed_agent_init and not result.get("confirm_required"):
+                    _restart_completed_failed_agent_build(
+                        params.get("session_id", ""), session, failed_ready
+                    )
+                    init_err = _wait_agent(session, rid)
+                    if init_err:
+                        return init_err
+                    if session.get("agent") is None:
+                        return _err(rid, 5032, "agent initialization failed")
+                    with _session_profile_runtime_scope(session):
+                        _persist_live_session_runtime(session)
             else:
                 result = _apply_model_switch(
                     "",
