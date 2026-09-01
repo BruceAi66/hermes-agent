@@ -66,6 +66,7 @@ FACT_STORE_SCHEMA = {
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
+            "origin": {"type": "string", "enum": ["owner", "agent", "untrusted", "system"], "description": "Provenance: owner=user said it, agent=derived from user content, untrusted=external (web/tool output), system=scaffolding. Default 'agent'."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
@@ -247,7 +248,7 @@ class HolographicMemoryProvider(MemoryProvider):
         if action == "add" and self._store and content:
             try:
                 category = "user_pref" if target == "user" else "general"
-                self._store.add_fact(content, category=category)
+                self._store.add_fact(content, category=category, origin="owner")
             except Exception as e:
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 
@@ -279,6 +280,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
+                    origin=args.get("origin", "agent"),
                 )
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
@@ -432,7 +434,7 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="user_pref")
+                        self._store.add_fact(content[:400], category="user_pref", origin="owner")
                         extracted += 1
                     except Exception:
                         pass
@@ -441,7 +443,7 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="project")
+                        self._store.add_fact(content[:400], category="project", origin="owner")
                         extracted += 1
                     except Exception:
                         pass

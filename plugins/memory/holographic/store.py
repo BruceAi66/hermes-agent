@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS facts (
     trust_score     REAL DEFAULT 0.5,
     retrieval_count INTEGER DEFAULT 0,
     helpful_count   INTEGER DEFAULT 0,
+    origin          TEXT DEFAULT 'agent',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     hrr_vector      BLOB
@@ -206,6 +207,9 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        # Migrate: add origin column if missing (provenance classification)
+        if "origin" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN origin TEXT DEFAULT 'agent'")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -217,12 +221,21 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        origin: str = "agent",
     ) -> int:
         """Insert a fact and return its fact_id.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
         the existing fact_id without modifying the row. Extracts entities from
         the content and links them to the fact.
+
+        ``origin`` is a provenance classification (owner/agent/untrusted/
+        system) mirroring the memory-provenance design: content from the
+        user directly is ``owner``, agent-derived from owner content is
+        ``agent``, externally-sourced (web/tool output) is ``untrusted``,
+        scaffolding (cron/heartbeat) is ``system``. Classification is
+        conservative — callers that cannot determine provenance should pass
+        ``untrusted`` rather than assume ``owner``.
         """
         with self._lock:
             content = content.strip()
@@ -232,10 +245,10 @@ class MemoryStore:
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO facts (content, category, tags, trust_score, origin)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust),
+                    (content, category, tags, self.default_trust, origin),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
