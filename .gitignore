@@ -214,3 +214,6 @@ native/fts5_cjk/*.so
 .lazy-refresh-incomplete
 hermes_cli/models.py.bak-*
 .skills_prompt_snapshot.json
+
+# Disposable profile created by scripts/probe_active_session_exclusivity.py
+.probe-home/
