@@ -21,8 +21,11 @@ from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from gateway.platforms.base import (BasePlatformAdapter, MessageEvent, MessageType, SendResult,
-                                    cache_document_from_bytes, cache_image_from_bytes)
+from gateway.platforms.base import (
+    BasePlatformAdapter, SendResult,
+    cache_document_from_bytes, cache_image_from_bytes,
+)
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.config import Platform, PlatformConfig
 from utils import is_truthy_value
 from gateway.platforms._shared import get_scoped_secret as _get_secret, coerce_port
@@ -148,8 +151,7 @@ def _send_imap_id(imap: "imaplib.IMAP4") -> None:
     connection, which imaplib cannot surface here — the failure appears one command later
     as a misleading SELECT error and the adapter retries forever (Purelymail, #39856).
     ``imap.capabilities`` is populated by imaplib at connect, so the check is free."""
-    caps = getattr(imap, "capabilities", ()) or ()
-    if "ID" not in caps:
+    if "ID" not in imap.capabilities:
         logger.debug(
             "[Email] Server does not advertise IMAP ID capability; skipping ID"
         )
