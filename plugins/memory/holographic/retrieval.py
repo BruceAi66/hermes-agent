@@ -94,43 +94,86 @@ class FactRetriever:
         rows = self._vector_rows(category)
         return self._rank_by_vector(rows, sim_fn, limit) if rows else self.search(fallback, category=category, limit=limit)
 
+    # ── 实体关系召回(2026-09-15 重写) ─────────────────────────────────────
+    # 原实现走 HRR 解绑代数:probe 用 unbind(fact, bind(entity, ROLE_ENTITY)) 试图还原内容向量,
+    # 但 bundle() 是相位圆周均值、unbind() 是相位相减,线性解绑恢复不成立 ——
+    # 实测恢复向量与内容向量相似度 ≈ 0(-0.03),目标事实排名 131–164/174,排序等于噪声。
+    # 改为直查关系表 entities/fact_entities(store 写入时已建,contradict 也用它):
+    # 精确、可解释、零向量重建,且不依赖 numpy。
+
+    def _relation_rows(self, names, category: str | None = None,
+                       require_all: bool = True, exclude_ids: set | None = None) -> list[dict]:
+        """实体精确命中的事实(大小写不敏感);require_all 时要求命中全部实体名。"""
+        lowered = sorted({str(n).strip().lower() for n in names if str(n).strip()})
+        if not lowered:
+            return []
+        cols = ", ".join(f"f.{c.strip()}" for c in _FACT_COLUMNS.split(","))
+        sql = (f"SELECT {cols}, COUNT(DISTINCT e.entity_id) AS hit_count "
+               "FROM facts f "
+               "JOIN fact_entities fe ON fe.fact_id = f.fact_id "
+               "JOIN entities e ON e.entity_id = fe.entity_id "
+               f"WHERE LOWER(e.name) IN ({','.join('?' for _ in lowered)})")
+        params: list = list(lowered)
+        if category:
+            sql += " AND f.category = ?"
+            params.append(category)
+        if exclude_ids:
+            sql += f" AND f.fact_id NOT IN ({','.join('?' for _ in exclude_ids)})"
+            params.extend(sorted(exclude_ids))
+        sql += " GROUP BY f.fact_id"
+        if require_all and len(lowered) > 1:
+            sql += f" HAVING hit_count = {len(lowered)}"
+        return [dict(r) for r in self.store._conn.execute(sql, params).fetchall()]
+
+    def _rank_relation_hits(self, rows: list[dict], names, limit: int) -> list[dict]:
+        """关系命中排序:命中覆盖率 × 信任分,再乘时间衰减;同分按更新时刻降序。"""
+        span = max(1, len({str(n).strip().lower() for n in names if str(n).strip()}))
+        for fact in rows:
+            fact["score"] = fact["trust_score"] * (fact.pop("hit_count", 1) / span)
+            if self.half_life > 0:
+                fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+        rows.sort(key=lambda f: (f["score"], f.get("updated_at") or f.get("created_at") or ""), reverse=True)
+        return rows[:limit]
+
+    def _co_entities(self, fact_ids: set, exclude: str) -> list[str]:
+        """这些事实里出现过的其他实体名(按出现次数降序)。"""
+        if not fact_ids:
+            return []
+        ph = ",".join("?" for _ in fact_ids)
+        rows = self.store._conn.execute(
+            f"SELECT e.name AS name, COUNT(*) AS n FROM entities e "
+            f"JOIN fact_entities fe ON fe.entity_id = e.entity_id "
+            f"WHERE fe.fact_id IN ({ph}) GROUP BY e.entity_id ORDER BY n DESC",
+            sorted(fact_ids)).fetchall()
+        skip = str(exclude).strip().lower()
+        return [r["name"] for r in rows if r["name"] and str(r["name"]).strip().lower() != skip]
+
     def probe(self, entity: str, category: str | None = None, limit: int = 10) -> list[dict]:
-        """Compositional entity query: unbind bind(entity, ROLE_ENTITY) from the category bank (or each fact vector)
-        to find facts where the entity plays a structural role. Not keyword search. Falls back to FTS5 without numpy."""
-        if not hrr._HAS_NUMPY:
-            return self.search(entity, category=category, limit=limit)
-        probe_key = hrr.bind(self._atom(entity.lower()), self._atom(_ROLE_ENTITY))
-        if category:  # category bank first, then individual fact vectors
-            bank_row = self.store._conn.execute("SELECT vector FROM memory_banks WHERE bank_name = ?", (f"cat:{category}",)).fetchone()
-            if bank_row:
-                extracted = hrr.unbind(self._phases(bank_row["vector"]), probe_key)
-                return self._rank_by_vector(self._vector_rows(category), lambda _f, fact_vec: hrr.similarity(extracted, fact_vec), limit)
-        role_content = self._atom(_ROLE_CONTENT)  # loop-invariant: encode once, not per row
-        # Does unbinding the probe key leave the fact's content signal?
-        return self._vector_query(entity, category, limit, lambda fact, fact_vec: hrr.similarity(
-            hrr.unbind(fact_vec, probe_key), hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)))
+        """关于某实体的全部事实(关系表精确命中)。无关系命中时回退 FTS 关键词检索。"""
+        hits = self._relation_rows([entity], category=category)
+        if hits:
+            return self._rank_relation_hits(hits, [entity], limit)
+        return self.search(entity, category=category, limit=limit)
 
     def related(self, entity: str, category: str | None = None, limit: int = 10) -> list[dict]:
-        """Facts structurally connected to an entity (shared context), not just facts *about* it as in probe.
-        Falls back to FTS5 without numpy."""
-        if not hrr._HAS_NUMPY:
+        """与实体结构相邻的事实:和该实体的共现实体出现在一起的事实(排除"关于该实体"本身)。"""
+        own = self._relation_rows([entity], category=category)
+        if not own:
             return self.search(entity, category=category, limit=limit)
-        entity_vec = self._atom(entity.lower())  # bare atom, not role-bound: ANY structural match
-        roles = (self._atom(_ROLE_ENTITY), self._atom(_ROLE_CONTENT))  # loop-invariant: encode once
-        # A residual similar to ANY role vector means the entity plays a structural role in the fact.
-        return self._vector_query(entity, category, limit, lambda _f, fact_vec: max(
-            hrr.similarity(hrr.unbind(fact_vec, entity_vec), role) for role in roles))
+        own_ids = {f["fact_id"] for f in own}
+        co_names = self._co_entities(own_ids, exclude=entity)
+        if not co_names:
+            return []
+        rows = self._relation_rows(co_names, category=category, require_all=False, exclude_ids=own_ids)
+        return self._rank_relation_hits(rows, co_names, limit) if rows else []
 
     def reason(self, entities: list[str], category: str | None = None, limit: int = 10) -> list[dict]:
-        """Multi-entity compositional query (vector-space JOIN): facts where ALL entities play structural roles.
-        Falls back to FTS5 without numpy."""
-        if not hrr._HAS_NUMPY or not entities:
-            return self.search(" ".join(entities), category=category, limit=limit)
-        role_entity, role_content = self._atom(_ROLE_ENTITY), self._atom(_ROLE_CONTENT)
-        probe_keys = [hrr.bind(self._atom(entity.lower()), role_entity) for entity in entities]
-        # AND semantics via min: high only if EVERY entity is structurally present.
-        return self._vector_query(" ".join(entities), category, limit, lambda _f, fact_vec: min(
-            hrr.similarity(hrr.unbind(fact_vec, key), role_content) for key in probe_keys))
+        """同时连接多个实体的事实(关系表 AND 语义)。没有任何事实同时命中全部实体时返回空列表
+        ——这就是 AND 的答案;不回退关键词检索,否则会返回只沾一个实体的事实(假阳性)。"""
+        if not entities:
+            return []
+        hits = self._relation_rows(entities, category=category, require_all=True)
+        return self._rank_relation_hits(hits, entities, limit) if hits else []
 
     def contradict(self, category: str | None = None, threshold: float = 0.3, limit: int = 10) -> list[dict]:
         """Pairs of facts sharing entities (same subject) with low content-vector similarity (different claims). Empty without numpy."""
