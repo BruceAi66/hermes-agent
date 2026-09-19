@@ -156,11 +156,12 @@ class MemoryStore:
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
         self._conn.executescript(_SCHEMA)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
+        from hermes_cli.sqlite_util import add_column_if_missing
         if "hrr_vector" not in columns:
-            self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+            add_column_if_missing(self._conn, "facts", "hrr_vector", "hrr_vector BLOB")
         # Migrate: add origin column if missing (provenance classification)
         if "origin" not in columns:
-            self._conn.execute("ALTER TABLE facts ADD COLUMN origin TEXT DEFAULT 'agent'")
+            add_column_if_missing(self._conn, "facts", "origin", "origin TEXT DEFAULT 'agent'")
         self._conn.commit()
 
     def _one(self, sql: str, params=()):

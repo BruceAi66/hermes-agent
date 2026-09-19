@@ -111,6 +111,8 @@ describe('transcribeAudioClientDirect', () => {
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
     expect(url).toBe('https://api.groq.com/openai/v1/audio/transcriptions')
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer gsk_test')
+    // A hung provider must not stall dictation forever: every STT upload carries a timeout signal.
+    expect(init.signal).toBeInstanceOf(AbortSignal)
 
     const form = init.body as FormData
     expect(form.get('model')).toBe('whisper-large-v3-turbo')
@@ -230,7 +232,10 @@ describe('synthesizeSpeechClientDirect', () => {
     const fetchMock = vi.fn(async () => new Response(bytes, { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
-    const audio = await synthesizeSpeechClientDirect(openaiTts, 'Hello there.')
+    const audio = await synthesizeSpeechClientDirect(
+      { ...openaiTts, extra_body: { consent_attestation: 'I own this voice' } },
+      'Hello there.'
+    )
 
     expect(new Uint8Array(audio)).toEqual(new Uint8Array([1, 2, 3]))
 
@@ -242,6 +247,8 @@ describe('synthesizeSpeechClientDirect', () => {
     expect(body.voice).toBe('nova')
     expect(body.input).toBe('Hello there.')
     expect(body.speed).toBeUndefined()
+    // Server-resolved tts.openai extras (consent_attestation for cloned voices) reach the wire.
+    expect(body.consent_attestation).toBe('I own this voice')
   })
 
   it('speaks the elevenlabs tts shape with the voice in the path', async () => {

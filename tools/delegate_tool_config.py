@@ -82,6 +82,14 @@ def _warn_once(flag_name: str, message: str, *args: Any) -> None:
         globals()[flag_name] = True
         logger.warning(message, *args)
 
+def _get_oneshot_max_children() -> int:
+    """delegation.oneshot_max_children (total children per finite one-shot session; 0 = unlimited)."""
+    return _knob(
+        "oneshot_max_children", None, lambda v: max(0, int(v)), 2,
+        "delegation.oneshot_max_children=%r is not a valid integer; using default 2",
+    )
+
+
 def _get_max_concurrent_children() -> int:
     """delegation.max_concurrent_children > DELEGATION_MAX_CONCURRENT_CHILDREN env > 10.
 
@@ -206,6 +214,19 @@ def _loaded_pool(key: Any):
     pool = load_pool(key)
     return pool if pool is not None and pool.has_credentials() else None
 
+def _pool_serves_endpoint(pool: Any, provider: Optional[str], base_url: Optional[str]) -> bool:
+    """Provider identity AND at least one entry for the child's endpoint; pools without entry metadata pass."""
+    from agent.credential_pool import (
+        credential_pool_entry_serves_endpoint as _entry_serves_endpoint, credential_pool_matches_provider,
+    )
+    if not credential_pool_matches_provider(pool, provider, base_url=base_url):
+        return False
+    entries_fn = getattr(pool, "entries", None)
+    if not callable(entries_fn):
+        return True
+    entries = entries_fn()
+    return not isinstance(entries, list) or any(_entry_serves_endpoint(entry, base_url) for entry in entries)
+
 def _resolve_child_credential_pool(
     effective_provider: Optional[str], parent_agent, effective_base_url: Optional[str] = None,
 ):
@@ -236,8 +257,14 @@ def _resolve_child_credential_pool(
                 return parent_pool
             return _loaded_pool(child_key)
         if parent_pool is not None and effective_provider == parent_provider:
-            return parent_pool
-        return _loaded_pool(effective_provider)
+            if not effective_base_url or _pool_serves_endpoint(parent_pool, effective_provider, effective_base_url):
+                return parent_pool
+            logger.debug("Parent %s pool has no entry for child endpoint %s; not sharing it",
+                         effective_provider, effective_base_url)
+        pool = _loaded_pool(effective_provider)
+        if pool is not None and effective_base_url and not _pool_serves_endpoint(pool, effective_provider, effective_base_url):
+            return None  # child keeps its fixed credential
+        return pool
     except Exception as exc:
         if effective_provider == "custom":
             logger.debug("Could not resolve custom credential pool for child endpoint '%s': %s", effective_base_url, exc)
