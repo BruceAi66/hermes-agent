@@ -110,6 +110,33 @@ def test_codex_pool_honors_hermes_codex_base_url(monkeypatch):
     assert resolved["base_url"] == "http://127.0.0.1:8787/v1"
 
 
+def test_codex_pool_honors_model_base_url(monkeypatch):
+    """#40913: model.base_url under provider openai-codex is the secondary proxy override; the
+    canonical URL stored on the pool row must not shadow it."""
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self, **_kwargs):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "openai-codex", "default": "gpt-5.3-codex", "base_url": "http://127.0.0.1:8400/backend-api/codex/"})
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["base_url"] == "http://127.0.0.1:8400/backend-api/codex"
+    assert resolved["api_mode"] == "codex_responses"
+
+
 class TestCustomProviderPoolLoopbackNoKeyExemption:
     """Regression for issue #86864: legacy custom_providers configs often
     used short/placeholder api_keys ('123', 'm') for local no-auth
@@ -642,6 +669,31 @@ def test_bare_custom_uses_loopback_model_base_url_when_provider_not_custom(monke
     assert resolved["base_url"] == "http://127.0.0.1:8082/v1"
     # 127.0.0.1 is not openai.com — OPENAI_API_KEY must not leak here
     assert resolved["api_key"] == "no-key-required"
+
+
+def test_codex_app_server_opt_in_routes_only_named_custom_providers(monkeypatch):
+    """#75186: ``model.openai_runtime: codex_app_server`` reaches a configured ``providers.<name>``
+    entry (codex selects it by id from its own config); anonymous ``custom`` has no stable id and
+    stays on chat_completions, as does the named entry without the opt-in."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config = {
+        "model": {"provider": "custom:my-gateway", "default": "gpt-5.4", "openai_runtime": "codex_app_server"},
+        "providers": {"my-gateway": {"api": "https://gateway.example.com/v1", "api_key": "test-key", "default_model": "gpt-5.4"}},
+    }
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+
+    resolved = rp.resolve_runtime_provider(requested="custom:my-gateway")
+    assert (resolved["provider"], resolved["requested_provider"], resolved["api_mode"]) == (
+        "custom", "custom:my-gateway", "codex_app_server")
+    assert resolved["api_key"] == "test-key"  # Hermes' own aux/fallback client keeps the credential
+
+    anonymous = rp.resolve_runtime_provider(requested="custom", explicit_base_url="https://gateway.example.com/v1",
+                                            explicit_api_key="k")
+    assert anonymous["api_mode"] == "chat_completions"
+
+    config["model"].pop("openai_runtime")
+    assert rp.resolve_runtime_provider(requested="custom:my-gateway")["api_mode"] == "chat_completions"
 
 
 def test_named_custom_provider_uses_saved_credentials(monkeypatch):
@@ -1993,6 +2045,49 @@ def test_removed_keyless_free_provider_points_at_its_replacements(name):
     assert excinfo.value.code == "invalid_provider"
     message = str(excinfo.value)
     assert "opencode-zen" in message and "opencode-go" in message
+
+
+def test_bare_custom_resolves_model_key_env_for_configured_base_url(monkeypatch):
+    """#67453: ``model.provider: custom`` + ``model.base_url`` + ``model.key_env`` (the setup wizard's
+    bare-custom shape) must send the named variable's value, not the ``no-key-required`` placeholder.
+    A CUSTOM_BASE_URL pointing elsewhere is a different endpoint: the declared key stays home."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
+    monkeypatch.setattr(rp, "load_config", lambda: {"custom_providers": []})
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "custom", "base_url": "https://api.example.test/v1", "key_env": "MY_LLM_API_KEY",
+        "default": "glm-5.2", "api_mode": "chat_completions"})
+    for var in ("CUSTOM_BASE_URL", "OPENROUTER_BASE_URL", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MY_LLM_API_KEY", "scw-real-key-0123456789abcdef")
+
+    resolved = rp.resolve_runtime_provider(requested="custom")
+    assert (resolved["base_url"], resolved["api_key"]) == ("https://api.example.test/v1", "scw-real-key-0123456789abcdef")
+
+    monkeypatch.setenv("CUSTOM_BASE_URL", "https://other.example.test/v1")
+    assert rp.resolve_runtime_provider(requested="custom")["api_key"] == "no-key-required"
+
+    # Direct-alias rung (`hermes --resume` provider change, `/model` direct aliases pass explicit_base_url):
+    # the declared key follows the configured endpoint and stays home for any other endpoint.
+    monkeypatch.delenv("CUSTOM_BASE_URL", raising=False)
+    direct = rp.resolve_runtime_provider(requested="custom", explicit_base_url="https://api.example.test/v1")
+    assert (direct["source"], direct["api_key"]) == ("direct-alias", "scw-real-key-0123456789abcdef")
+    other = rp.resolve_runtime_provider(requested="custom", explicit_base_url="https://other.example.test/v1")
+    assert other["api_key"] == "no-key-required"
+
+
+def test_configured_key_env_resolving_empty_is_logged(monkeypatch, caplog):
+    """#67453: a declared ``key_env`` whose variable is unset used to be laundered silently into
+    ``no-key-required`` and surface only as the provider's 403; a keyless block stays silent."""
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
+    monkeypatch.setattr(rp, "load_config", lambda: {"custom_providers": [
+        {"name": "scw", "base_url": "https://api.example.test/v1", "key_env": "UNSET_LLM_KEY", "model": "m"},
+        {"name": "local", "base_url": "http://127.0.0.1:8080/v1", "model": "m"}]})
+    monkeypatch.delenv("UNSET_LLM_KEY", raising=False)
+    with caplog.at_level("WARNING", logger="hermes_cli.runtime_provider"):
+        assert rp.resolve_runtime_provider(requested="custom:scw")["api_key"] == "no-key-required"
+        assert rp.resolve_runtime_provider(requested="custom:local")["api_key"] == "no-key-required"
+    hits = [r for r in caplog.records if "UNSET_LLM_KEY" in r.getMessage()]
+    assert len(hits) == 1 and "scw" in hits[0].getMessage()
 
 
 # ── model.openai_runtime: codex_app_server on every ladder rung (#115169) ─────────────────

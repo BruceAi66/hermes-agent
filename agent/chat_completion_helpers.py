@@ -601,6 +601,21 @@ def _configured_stale_base(agent) -> float:
     return cfg if cfg is not None else env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
 
 
+def _local_stream_stale_timeout_default() -> float:
+    """Local-provider stale ceiling: ``agent.local_stream_stale_timeout`` (900s) or
+    HERMES_LOCAL_STREAM_STALE_TIMEOUT. Shared by the stream stale detector and the
+    Responses first-event watchdog so both give a local server the same prefill grace."""
+    local_default = 900.0
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()  # read-only consumer — no deepcopy
+        agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+        value = agent_cfg.get("local_stream_stale_timeout") if isinstance(agent_cfg, dict) else None
+        if isinstance(value, (int, float)):
+            local_default = float(value)
+    return env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", local_default)
+
+
 def _scale_stale_timeout_for_context(base: float, est_tokens: int) -> float:
     """Large contexts: slow models think for minutes before the first token;
     scale the threshold or the detector kills healthy streams."""
@@ -1164,6 +1179,16 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
                 "(context=~%s tokens) per HERMES_CODEX_TTFB_MAX_SECONDS.", ttfb_timeout, ttfb_cap,
                 f"{est_tokens:,}")
             ttfb_timeout = ttfb_cap
+    elif not ttfb_explicit and (base_url := getattr(agent, "base_url", None)) and is_local_endpoint(base_url):
+        # A local server prefills for minutes before its first event; the chat-completions
+        # siblings already grant local endpoints the local stale ceiling, so the Responses
+        # transport gets the same grace instead of the 120s hosted cutoff (#92302).
+        local_ceiling = _local_stream_stale_timeout_default()
+        if local_ceiling > ttfb_timeout:
+            logger.info("Local provider detected (%s) — no-event TTFB watchdog raised from %.0fs to %.0fs "
+                "(agent.local_stream_stale_timeout); set HERMES_CODEX_TTFB_TIMEOUT_SECONDS for an explicit cutoff.",
+                base_url, ttfb_timeout, local_ceiling)
+            ttfb_timeout = local_ceiling
     if ttfb_enabled and not ttfb_explicit:
         # High-effort thinking precedes the first event; the floor outranks the cap.
         ttfb_timeout = max(ttfb_timeout, effort_floor)
@@ -1234,6 +1259,12 @@ def _reasoning_config_for_wire(agent):
     """
     cfg = agent.reasoning_config
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
+    if getattr(agent, "_reasoning_effort_rejected", False):
+        # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
+        # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
+        # the route default — as the auxiliary ladder does; resending would 400 identically.
+        agent._wire_reasoning_config = None
+        return None
     if getattr(agent, "_reasoning_disable_rejected", False):
         # The route rejects disables. Resend exactly what the session has
         # been sending — the user's own config — so the retry lands on the
@@ -1248,11 +1279,18 @@ def _reasoning_config_for_wire(agent):
         ):
             if getattr(agent, "_reasoning_floor_required", False):
                 from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
-                return {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
+                floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
+                agent._wire_reasoning_config = floored
+                return floored
+            agent._wire_reasoning_config = None
             return None
+        agent._wire_reasoning_config = cfg
         return cfg
     if ephemeral_off:
         cfg = {**(cfg or {}), "enabled": False, "effort": "none"}
+    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
+    # disable (drop the disable) from a rejected level (drop the reasoning fields).
+    agent._wire_reasoning_config = cfg
     return cfg
 
 
@@ -1345,7 +1383,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
         replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
-        context_management=context_management)
+        context_management=context_management, text_verbosity=getattr(agent, "text_verbosity", None))
 
 
 
@@ -1418,15 +1456,15 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode.
 
-    Wraps the per-api_mode builder so the OpenCode ``x-opencode-session``
-    affinity header rides on every OpenCode request regardless of transport
-    (chat_completions / codex_responses / anthropic_messages all route
-    OpenCode models). No-op for every other provider.
+    Wraps the per-api_mode builder so the conversation-affinity headers (OpenCode's
+    ``x-opencode-session``, a custom provider's opt-in ``session_affinity_header``) ride on
+    every request regardless of transport (chat_completions / codex_responses /
+    anthropic_messages). No-op for every other provider.
     """
-    from agent.opencode_affinity import merge_opencode_session_headers
+    from agent.opencode_affinity import merge_session_affinity_headers
 
     kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
-    return merge_opencode_session_headers(
+    return merge_session_affinity_headers(
         kwargs,
         getattr(agent, "provider", None),
         getattr(agent, "base_url", None),
@@ -3549,15 +3587,7 @@ class _StreamingCall(StreamingWaitMonitor):
         floored for known reasoning models (else BrokenPipeError from the gateway)."""
         base = _configured_stale_base(self.agent)
         if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
-            _local_default = 900.0
-            with contextlib.suppress(Exception):
-                from hermes_cli.config import load_config_readonly
-                _cfg = load_config_readonly()  # read-only consumer — no deepcopy
-                _agent_cfg = _cfg.get("agent") if isinstance(_cfg, dict) else None
-                _v = _agent_cfg.get("local_stream_stale_timeout") if isinstance(_agent_cfg, dict) else None
-                if isinstance(_v, (int, float)):
-                    _local_default = float(_v)
-            self._stream_stale_timeout = env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", _local_default)
+            self._stream_stale_timeout = _local_stream_stale_timeout_default()
             logger.debug("Local provider detected (%s) — stale stream timeout set to %.0fs",
                 self.agent.base_url, self._stream_stale_timeout)
             return

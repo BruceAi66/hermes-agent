@@ -207,6 +207,64 @@ describe('transcribeAudioClientDirect', () => {
     expect((init.headers as Record<string, string>)['xi-api-key']).toBe('gsk_test')
     expect((init.body as FormData).get('model_id')).toBe('scribe_v2')
   })
+
+  /** A fetch that only settles when its AbortSignal fires — a wedged STT endpoint. */
+  function hangingFetch() {
+    return vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        })
+    )
+  }
+
+  it('aborts a hanging transcription at the default 60 s instead of transcribing forever', async () => {
+    vi.useFakeTimers()
+
+    try {
+      mockDesktopApi({ ok: true, stt: directStt, tts: relay })
+      const fetchMock = hangingFetch()
+      vi.stubGlobal('fetch', fetchMock)
+
+      const pending = transcribeAudioClientDirect(new Blob(['x'], { type: 'audio/webm' }))
+      const settled = vi.fn()
+
+      pending.then(settled, settled)
+      await vi.advanceTimersByTimeAsync(0)
+
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+      expect(init.signal).toBeInstanceOf(AbortSignal)
+
+      await vi.advanceTimersByTimeAsync(59_000)
+      expect(settled).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      await expect(pending).rejects.toThrow(/Transcription timed out after 60s/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('honours the gateway-resolved stt.openai.timeout for the direct request', async () => {
+    vi.useFakeTimers()
+
+    try {
+      mockDesktopApi({ ok: true, stt: { ...directStt, timeout_s: 5 }, tts: relay })
+      vi.stubGlobal('fetch', hangingFetch())
+
+      const pending = transcribeAudioClientDirect(new Blob(['x'], { type: 'audio/webm' }))
+      const settled = vi.fn()
+
+      pending.then(settled, settled)
+      await vi.advanceTimersByTimeAsync(4_900)
+      expect(settled).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(200)
+      await expect(pending).rejects.toThrow(/Transcription timed out after 5s/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('synthesizeSpeechClientDirect', () => {
@@ -340,5 +398,14 @@ describe('cutSentences', () => {
 
     expect(sentences[0]).toContain('。')
     expect(sentences).toHaveLength(2)
+  })
+
+  it('cuts a short CJK opener alone when the backend sends tts.streaming.min_len', () => {
+    const text = '记得，叫团团。 然后我们再说第二句话，这一句要长一些才行。 '
+
+    // Historical 24-char floor (older backend, no key): the opener rides with sentence two.
+    expect(cutSentences(text, false).sentences).toEqual(['记得，叫团团。 然后我们再说第二句话，这一句要长一些才行。'])
+    // tts.streaming.min_len = 6 (the CJK voice setup from #96927): spoken on its own.
+    expect(cutSentences(text, false, 6).sentences).toEqual(['记得，叫团团。', '然后我们再说第二句话，这一句要长一些才行。'])
   })
 })

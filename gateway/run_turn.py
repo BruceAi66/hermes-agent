@@ -179,6 +179,10 @@ class GatewayTurnMixin:
             _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
         )
         skey = self._resolve_session_key_or_none(source, session_key)
+        # Every exit path starts clean: the /model-override fast path returns before the pop below,
+        # and hygiene/inbound callers resolve without a turn runner consuming the stash — a stale
+        # notice must never attach to another session's next turn (#74349).
+        self._pre_agent_fallback_notice = None
 
         model = _resolve_gateway_model(user_config)
         if skey:
@@ -218,6 +222,9 @@ class GatewayTurnMixin:
             )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+        # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
+        # runner surfaces it through the agent's one-shot fallback notice (#74349).
+        self._pre_agent_fallback_notice = runtime_kwargs.pop("_fallback_notice", None)
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
@@ -1627,6 +1634,8 @@ class GatewayTurnMixin:
                 context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                 context_length=agent_result.get("context_length") or None,
                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
+                requested_model=agent_result.get("requested_model"),
+                served_model=agent_result.get("served_model"),
             )
         except Exception as _footer_err:
             logger.debug("runtime_footer build failed: %s", _footer_err)

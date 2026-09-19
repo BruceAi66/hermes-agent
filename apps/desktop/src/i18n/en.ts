@@ -4161,6 +4161,7 @@ export const en: Translations = {
       errorGenericProvider: 'The AI service',
       errorToastTitle: "Hermes couldn't finish the reply",
       errorRetry: 'Retry',
+      errorLimitResets: time => `Limit resets at ${time}`,
       errorStartNewSession: 'Start new session',
       errorSwitchProvider: 'Switch provider',
       errorChooseModel: 'Choose a model',

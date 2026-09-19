@@ -58,6 +58,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes migrate` | Diagnose and (optionally) rewrite `config.yaml` to replace references to retired models or deprecated settings (e.g. `migrate xai`). |
 | `hermes codex-runtime` | Noninteractive counterpart of `/codex-runtime`: `migrate [--dry-run] [--json]` regenerates the Hermes-managed block in `~/.codex/config.toml` for the selected profile. See [Codex app-server runtime](../user-guide/features/codex-app-server-runtime.md#running-the-migration-from-a-script). |
 | `hermes status` | Show agent, auth, and platform status. |
+| `hermes usage` | Show the configured account's rate-limit windows (the `/usage` block) without a session; `--json` for scripts. |
 | `hermes cron` | Inspect and tick the cron scheduler. |
 | `hermes pause` / `hermes resume` | Global emergency stop: no new cron fires (built-in ticker, managed-cron webhook, misfire catch-up), kanban dispatch or gateway turns start until resumed; in-flight work is never killed. |
 | `hermes kanban` | Multi-profile collaboration board (tasks, links, dispatcher). |
@@ -252,9 +253,9 @@ stdout is non-empty.
 `hermes -z "…" --usage-file /path/report.json` writes a machine-readable usage report after the run: `estimated_cost_usd`, `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_write_tokens` / `reasoning_tokens` / `total_tokens`, `api_calls`, `model`, `provider`, `session_id`, `service_tier`, the `completed` / `failed` / `partial` / `interrupted` flags and `turn_exit_reason` (why `completed` is false, e.g. `max_iterations_reached(3/3)`). Those top-level counters cover the **main agent loop** only. Auxiliary LLM calls made on the same run (title generation, vision, context compression, `web_extract`, background review, …) are reported separately under `auxiliary` — the same totals plus a per-task `by_task` map — and `total_including_auxiliary` (`estimated_cost_usd`, `total_tokens`, `api_calls`) is the grand total to bill on. The report is written **even when the run fails**, so batch pipelines can always account for spend. It has no effect outside `-z`/`--oneshot`, and a broken usage write never masks the run's own outcome.
 
 ```bash
-hermes -z "summarize this repo" --usage-file /tmp/usage.json
-jq .total_including_auxiliary.estimated_cost_usd /tmp/usage.json
-jq .auxiliary.by_task /tmp/usage.json      # what did title generation / vision cost?
+hermes -z "summarize this repo" --usage-file ~/.hermes/cache/scratch/usage.json
+jq .total_including_auxiliary.estimated_cost_usd ~/.hermes/cache/scratch/usage.json
+jq .auxiliary.by_task ~/.hermes/cache/scratch/usage.json      # what did title generation / vision cost?
 ```
 
 ## `hermes model`
@@ -496,15 +497,15 @@ If neither a positional `message` argument nor `--file` is provided, `hermes sen
 `--file` is for *text* bodies only. To deliver an image, document, video, or audio file as a native platform attachment, reference it inside the message text with the `MEDIA:<local_path>` directive:
 
 ```bash
-hermes send --to telegram "MEDIA:/tmp/screenshot.png"
-hermes send --to telegram "Build chart for today MEDIA:/tmp/chart.png"   # with caption
-hermes send --to discord:#ops "MEDIA:/tmp/report.pdf"
+hermes send --to telegram "MEDIA:~/.hermes/cache/scratch/screenshot.png"
+hermes send --to telegram "Build chart for today MEDIA:~/.hermes/cache/scratch/chart.png"   # with caption
+hermes send --to discord:#ops "MEDIA:~/.hermes/cache/scratch/report.pdf"
 ```
 
 By default, image files are sent as photos (platforms like Telegram recompress these). Add `[[as_document]]` to the message to deliver them as uncompressed file attachments instead:
 
 ```bash
-hermes send --to telegram "[[as_document]] MEDIA:/tmp/screenshot.png"
+hermes send --to telegram "[[as_document]] MEDIA:~/.hermes/cache/scratch/screenshot.png"
 ```
 
 Examples:
@@ -512,7 +513,7 @@ Examples:
 ```bash
 hermes send --to telegram "deploy finished"
 echo "RAM 92%" | hermes send --to telegram:-1001234567890
-hermes send --to discord:#ops --file /tmp/report.md
+hermes send --to discord:#ops --file ~/.hermes/cache/scratch/report.md
 hermes send --to slack:#eng --subject "[CI]" --file build.log
 hermes send --list                  # all platforms
 hermes send --list telegram         # filter by platform
@@ -685,6 +686,49 @@ hermes auth spotify                                      # Authenticate Hermes w
 ```
 
 Subcommands: `add`, `list`, `remove`, `reset`, `priority`, `refresh`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
+
+## `hermes usage`
+
+The account-limits block of the `/usage` slash command — Codex 5-hour / weekly windows, plan and banked
+resets; Anthropic OAuth windows; OpenRouter credits — without starting a session, so shell scripts and cron
+jobs can read it.
+
+```bash
+hermes usage                          # configured model provider, human-readable block
+hermes usage --provider openai-codex  # a specific provider
+hermes usage --json                   # one JSON document on stdout
+```
+
+| Option | Description |
+|--------|-------------|
+| `--provider NAME` | Provider to query (default: the configured `model.provider`). Supported: `openai-codex`, `anthropic`, `openrouter`. |
+| `--json` | Print one JSON document instead of the human-readable block. |
+
+Credentials resolve exactly as they do for `/usage` in a session with no live agent (the auth store, then
+the credential pool); the command never adds or refreshes a credential it would not use for chat. Exit code
+`0` on success; `1` with a single stderr line when no credential is configured for the provider, the provider
+has no usage endpoint, or the fetch fails (stdout stays empty).
+
+`--json` schema (keys are stable; new keys may be added):
+
+```json
+{
+  "provider": "openai-codex",
+  "source": "usage_api",
+  "title": "Account limits",
+  "plan": "Plus",
+  "fetched_at": "2026-09-19T07:58:55+00:00",
+  "windows": [
+    {"label": "Session", "used_percent": 37.0, "resets_at": "2026-09-19T21:00:00+00:00", "detail": null},
+    {"label": "Weekly", "used_percent": 12.5, "resets_at": "2026-09-25T09:00:00+00:00", "detail": null}
+  ],
+  "details": ["You have 1 reset banked - use /usage reset to activate"],
+  "unavailable_reason": null
+}
+```
+
+`used_percent` is `null` when the provider did not report the window; `resets_at` is ISO-8601 UTC or `null`
+(some windows carry a free-text `detail` instead); `plan` is `null` when unknown.
 
 ## `hermes status`
 
@@ -1069,7 +1113,7 @@ The backup uses SQLite's `backup()` API for safe copying, so it works correctly 
 
 ```bash
 hermes backup                           # Full backup to ~/hermes-backup-*.zip
-hermes backup -o /tmp/hermes.zip        # Full backup to specific path
+hermes backup -o ~/backups/hermes.zip   # Full backup to specific path
 hermes backup --quick                   # Quick state-only snapshot
 hermes backup --quick --label "pre-upgrade"  # Quick snapshot with label
 ```

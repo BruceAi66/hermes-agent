@@ -1340,6 +1340,13 @@ def _apply_agent_section(agent, _agent_cfg):
     # "auto" (codex_responses only), true (all api_modes), false, or model substrings.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    # Responses `text.verbosity`: "" / unknown value = not sent (never flips the provider default).
+    _verbosity = str(_agent_section.get("text_verbosity") or "").strip().lower()
+    if _verbosity and _verbosity not in {"low", "medium", "high"}:
+        logger.warning("Unknown agent.text_verbosity %r; expected low, medium or high — ignoring", _verbosity)
+        _verbosity = ""
+    agent.text_verbosity = _verbosity or None
+
     # Default-on boolean gates: anti-stall guards (notice-only), universal guidance toggles
     # (ALL models, unlike enforcement), the local toolchain probe, Bot Mode protocol section.
     for _key in (
@@ -1750,6 +1757,9 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
 
     # Persisted for switch_model / fallback AFTER the custom_providers branch (per-model overrides).
     agent._config_context_length = _config_context_length
+    if _config_context_length is not None:
+        from agent.context_pin import warn_once_on_pin_disagreement
+        warn_once_on_pin_disagreement(agent.model, agent.base_url or "", _config_context_length)
 
     _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(_config_context_length)
     if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):

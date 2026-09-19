@@ -101,22 +101,58 @@ def _notification_belongs_to_turn(note: dict, *, thread_id: Optional[str], turn_
     )
 
 
-def _coerce_turn_input_text(user_input: Any) -> str:
-    """Collapse rich content parts into app-server text (``turn/start`` is text-only; images become a marker)."""
+_TEXT_PART_TYPES = frozenset({"text", "input_text"})
+_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+_IMAGE_URL_SCHEMES = ("data:", "http://", "https://")
+
+
+def _image_part_to_turn_input(item: dict) -> Optional[dict]:
+    """Map one Hermes image part onto the app-server ``UserInput`` shape.
+
+    ``turn/start`` accepts ``{type: image, url}`` (data:/http URLs) and ``{type: localImage, path}``
+    natively (protocol schema ``v2/UserInput``), so nothing here is flattened into a text marker.
+    """
+    ref = item.get("image_url") or item.get("url") or item.get("path") or item.get("image")
+    if isinstance(ref, dict):
+        ref = ref.get("url") or ref.get("path")
+    ref = (ref or "").strip() if isinstance(ref, str) else ""
+    if not ref:
+        return None
+    if ref.startswith(_IMAGE_URL_SCHEMES):
+        return {"type": "image", "url": ref}
+    if ref.startswith("file://"):
+        ref = ref[len("file://"):]
+    return {"type": "localImage", "path": ref}
+
+
+def _build_turn_input(user_input: Any) -> tuple[list[dict], str]:
+    """Build the ``turn/start`` ``input`` list plus the text the wire will echo back.
+
+    Text parts stay text; image parts ride natively (#51053 — a text marker in their place left the
+    model blind to the attachment). Returns ``(input_items, submitted_text)``.
+    """
     if isinstance(user_input, str):
-        return user_input
+        return [{"type": "text", "text": user_input}], user_input
     if not isinstance(user_input, list):
-        return "" if user_input is None else str(user_input)
-    parts: list[str] = []
+        text = "" if user_input is None else str(user_input)
+        return [{"type": "text", "text": text}], text
+    texts: list[str] = []
+    images: list[dict] = []
     for item in user_input:
         if not isinstance(item, dict):
             if item.strip() if isinstance(item, str) else item is not None:
-                parts.append(str(item))
-        elif item.get("type") in {"text", "input_text"}:
-            parts.append(str(item.get("text") or item.get("content") or ""))
-        elif item.get("type") in {"image", "image_url", "input_image"}:
-            parts.append("[image attached]")
-    return "\n\n".join(p for p in parts if p).strip() or "What do you see in this image?"
+                texts.append(str(item))
+        elif item.get("type") in _TEXT_PART_TYPES:
+            texts.append(str(item.get("text") or item.get("content") or ""))
+        elif item.get("type") in _IMAGE_PART_TYPES:
+            mapped = _image_part_to_turn_input(item)
+            if mapped is not None:
+                images.append(mapped)
+    text = "\n\n".join(t for t in texts if t).strip()
+    if not text and images:
+        text = "What do you see in this image?"
+    items: list[dict] = [{"type": "text", "text": text}] if text or not images else []
+    return items + images, text
 
 
 # Strong credential-failure signals: trusted whether they appear in the primary
@@ -164,10 +200,21 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        model: Optional[str] = None, model_provider: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        # ``thread/start.model`` / ``.modelProvider``: select a provider from codex's own
+        # ``[model_providers.<id>]`` table. Only the id travels; codex reads base_url/env_key itself.
+        self._model = (model or "").strip() or None
+        self._model_provider = (model_provider or "").strip() or None
+        # Hermes' composed system prompt (SOUL.md, memory, channel overrides). Sent ONCE per thread as
+        # ``thread/start.developerInstructions``: codex keeps its own base instructions (tool guidance) and
+        # inserts this as the first developer message of every model request. ``baseInstructions`` would
+        # REPLACE codex's base and ``instructions`` is accepted but ignored (verified against codex 0.147).
+        self._developer_instructions = developer_instructions
         self._permission_profile = permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
             os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"), "workspace-write"
         )
@@ -195,7 +242,16 @@ class CodexAppServerSession:
         self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
         # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
         # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.
-        result = self._client.request("thread/start", {"cwd": self._cwd}, timeout=15)
+        # Hermes supplies the agent identity through its own system prompt; ``personality: "none"`` strips
+        # codex's built-in "# Personality" section from the base instructions so it cannot compete (#72104).
+        params: dict[str, Any] = {"cwd": self._cwd, "personality": "none"}
+        if self._developer_instructions and self._developer_instructions.strip():
+            params["developerInstructions"] = self._developer_instructions
+        if self._model_provider:
+            params["modelProvider"] = self._model_provider
+        if self._model:
+            params["model"] = self._model
+        result = self._client.request("thread/start", params, timeout=15)
         # Different codex versions serialize the id under thread.id / sessionId / threadId.
         thread_obj = result.get("thread") or {}
         thread_id = thread_obj.get("id") or thread_obj.get("sessionId") or result.get("sessionId") or result.get("threadId")
@@ -363,10 +419,10 @@ class CodexAppServerSession:
             if self._interrupt_event.is_set():
                 result.interrupted = True
             else:
-                result.submitted_user_text = _coerce_turn_input_text(user_input)
+                input_items, result.submitted_user_text = _build_turn_input(user_input)
                 ts = self._request_for(
                     result, "turn/start",
-                    {"threadId": self._thread_id, "input": [{"type": "text", "text": result.submitted_user_text}]},
+                    {"threadId": self._thread_id, "input": input_items},
                     "turn/start",
                 )
                 if ts is not None:

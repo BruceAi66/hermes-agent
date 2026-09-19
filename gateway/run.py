@@ -40,6 +40,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+from hermes_cli.fallback_config import pre_agent_fallback_notice
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -2230,14 +2231,26 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_with_fallback, format_runtime_provider_error, _get_model_config)
 
+    # Capture primary provider/model from config before the try block so we
+    # can include it in the fallback notice if the primary fails (#74349).
+    _model_cfg = _get_model_config()
+    _primary_model = (_model_cfg.get("default") or "").strip()
+    _primary_provider = (_model_cfg.get("provider") or "").strip()
+
     try:
         runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     if fallback_entry is not None:
-        # The entry's model is the one this agent must send (#112600).
-        return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"]}
+        # The entry's model is the one this agent must send (#112600). Carry the fallback notice so the
+        # gateway can surface a user-visible provider switch (#74349); the caller must pop
+        # ``_fallback_notice`` before forwarding kwargs to AIAgent.
+        return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
+                "_fallback_notice": pre_agent_fallback_notice(
+                    _primary_provider, _primary_model,
+                    runtime.get("provider") or fallback_entry.get("provider") or "unknown",
+                    fallback_entry.get("model") or "default")}
 
     capabilities = runtime.get("capabilities")
     capabilities = (

@@ -2842,3 +2842,171 @@ def test_run_codex_stream_retired_request_stops_firing_callbacks(monkeypatch):
 
     assert streamed == ["keep"]
     assert "DROPPED" not in streamed
+
+
+def _raise_prestream_transport_error(request):
+    """Raise the #103673 shape: APIConnectionError <- ReadError <- ReadError."""
+    import httpx
+
+    from openai import APIConnectionError
+
+    inner = httpx.ReadError("receive failed", request=request)
+    mid = httpx.ReadError("receive failed", request=request)
+    try:
+        raise mid from inner
+    except httpx.ReadError as chained:
+        raise APIConnectionError(request=request) from chained
+
+
+def _completed_create_stream():
+    message_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="Recovered.")],
+    )
+    usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
+    return _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.output_item.done", item=message_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    usage=usage,
+                    id="resp_prestream_retry_1",
+                ),
+            ),
+        ]
+    )
+
+
+def test_run_codex_stream_retries_prestream_apiconnectionerror(monkeypatch):
+    """Regression test for issue #103673.
+
+    A pre-stream ``APIConnectionError`` wrapping an httpx transport error
+    (``ReadError`` before the first SSE event, stream never opened) must retry
+    with a fresh physical request like a raw transport error does, instead of
+    failing the turn on a transient connect/receive failure.
+    """
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    request = httpx.Request(
+        "POST",
+        "https://chatgpt.com/backend-api/codex/responses",
+        content=b'{"model":"gpt-5-codex"}',
+    )
+    calls = {"count": 0}
+
+    def _fake_create(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            _raise_prestream_transport_error(request)
+        return _completed_create_stream()
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["count"] == 2
+    assert response.status == "completed"
+    assert response.id == "resp_prestream_retry_1"
+
+
+def test_run_codex_stream_prestream_retry_exhaustion_logs_telemetry(
+    monkeypatch, caplog
+):
+    """Regression test for issue #103673 (observability half).
+
+    When the pre-stream retry is exhausted, the turn still raises, but the
+    single WARNING must carry the byte count, the stream-open state, the
+    exception chain, and the attempt count -- without prompt content.
+    """
+    import logging
+
+    import httpx
+    from openai import APIConnectionError
+
+    agent = _build_agent(monkeypatch)
+    body = b'{"model":"gpt-5-codex"}'
+    request = httpx.Request(
+        "POST", "https://chatgpt.com/backend-api/codex/responses", content=body
+    )
+    calls = {"count": 0}
+
+    def _fake_create(**kwargs):
+        calls["count"] += 1
+        _raise_prestream_transport_error(request)
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+
+    with caplog.at_level(logging.WARNING, logger="agent.codex_runtime"):
+        with pytest.raises(APIConnectionError):
+            agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["count"] == 2
+    failures = [
+        record
+        for record in caplog.records
+        if "Codex Responses request failed" in record.message
+    ]
+    assert len(failures) == 1
+    message = failures[0].message
+    assert f"serialized_request_body_bytes={len(body)}" in message
+    assert "stream_opened=false" in message
+    assert "APIConnectionError <- ReadError <- ReadError" in message
+    assert "attempt=2/2" in message
+
+
+def _codex_truncated_tool_call_response():
+    """``status=incomplete`` (max_output_tokens) whose function_call item was cut mid-arguments
+    and settled as ``completed`` — the self-hosted /v1/responses shape from #91770."""
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="function_call", id="fc_1", call_id="call_1", name="terminal",
+                arguments='{"command": "echo hel', status="completed",
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=50, output_tokens=8, total_tokens=58),
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        model="gpt-5.4",
+    )
+
+
+def test_codex_truncated_tool_call_is_retried_with_boosted_output_budget(monkeypatch):
+    """A tool call cut off by max_output_tokens on the Responses wire gets the same
+    budget-boost retry as chat modes instead of a refused partial turn (#91770)."""
+    agent = _build_copilot_agent(monkeypatch)
+    agent.max_tokens = 1000
+    responses = [_codex_truncated_tool_call_response(), _codex_message_response("Done.")]
+    seen_caps: list = []
+
+    def _fake_call(api_kwargs):
+        seen_caps.append(api_kwargs.get("max_output_tokens"))
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_call)
+
+    result = agent.run_conversation("run it")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Done."
+    assert seen_caps == [1000, 2000]
+    # The retry re-issues the same call: no interim assistant row, no continuation nudge.
+    assert [m["role"] for m in result["messages"] if m["role"] != "system"] == ["user", "assistant"]
+
+
+def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypatch):
+    """Text truncation is not rerouted: it stays on the Codex incomplete continuation and
+    never takes the length path's nudge (no double continuation, #91770)."""
+    agent = _build_copilot_agent(monkeypatch)
+    responses = [_codex_max_output_incomplete_response("Partial"), _codex_message_response("rest.")]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    result = agent.run_conversation("write")
+
+    assert result["completed"] is True
+    assert not any(m.get("_length_continuation_nudge") for m in result["messages"])
+    assert any(m.get("finish_reason") == "incomplete" for m in result["messages"] if m["role"] == "assistant")

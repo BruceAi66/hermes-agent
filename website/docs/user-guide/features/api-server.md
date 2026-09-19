@@ -153,6 +153,8 @@ OpenAI Responses API format. Supports server-side conversation state via `previo
 
 Tool calls in the `output` array were already executed server-side by the Hermes agent — they are replayed with `"status": "completed"` for structured tool UI, never as pending calls for the client to execute.
 
+With `"stream": true`, mid-turn assistant commentary (the `openai-codex` backend's `phase="commentary"` progress preambles, or text a model writes alongside its tool calls) arrives as its own completed `message` output item carrying `"phase": "commentary"` (`response.output_item.added` + `response.output_item.done`, also listed in `response.completed`). It is never merged into the final answer item, so clients can render it as live progress and skip it when assembling the reply. Private reasoning never reaches this item. `display.interim_assistant_messages: false` (or the `display.platforms.api_server` override) suppresses it on every API-server surface.
+
 **Inline image input:** `input[].content` can contain `input_text` and `input_image` parts. Both remote URLs and `data:image/...` URLs are supported:
 
 ```json
@@ -486,6 +488,13 @@ Statuses are retained briefly after terminal states (`completed`, `failed`, `can
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
 
+Mid-turn assistant commentary — the `openai-codex` backend's `phase="commentary"` progress
+preambles, or text a model writes alongside its tool calls — arrives as `message.interim`
+(`text`, `already_streamed`), the same contract the TUI gateway uses. `already_streamed: true`
+means the text also went out as `message.delta`, so clients that render deltas can skip it.
+The final answer still arrives only in `run.completed`; private reasoning never becomes
+`message.interim`. Gate: `display.interim_assistant_messages` (default `true`).
+
 Tool lifecycle events carry `tool.started` (`tool`, `preview` of the arguments) and
 `tool.completed` (`tool`, `duration` in seconds, `error`, and a `preview` of the result). The
 `error` flag reflects the tool's own outcome — a non-zero terminal `exit_code`, a structured
@@ -601,7 +610,7 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
-| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, then a terminal `run.completed` / `run.failed` / `run.cancelled` event that matches how the turn ended (see [Terminal run status](../../developer-guide/programmatic-integration.md#terminal-run-status)) |
+| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `assistant.commentary` (mid-turn commentary: `message_id`, `text`, `already_streamed`; never folded into `assistant.completed`), `tool.started`, `tool.completed`, then a terminal `run.completed` / `run.failed` / `run.cancelled` event that matches how the turn ended (see [Terminal run status](../../developer-guide/programmatic-integration.md#terminal-run-status)) |
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 
@@ -721,6 +730,7 @@ gateway:
     cors_origins: http://localhost:3000
     model_name: my-hermes
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
+    history_tool_output_max_chars: 0   # cap tool outputs in stored /v1/responses history; 0 = verbatim
 ```
 
 `port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
@@ -728,6 +738,10 @@ gateway:
 ### Concurrent-run cap
 
 The API server limits how many agent runs may execute at once across the endpoints that start one directly: the OpenAI-compatible endpoints, the Runs endpoints, and the session-chat endpoints (`POST /api/sessions/{id}/chat` and its `/stream` variant, which carry cross-machine agent DMs). Cron-triggered runs (`POST /api/jobs/{id}/run`, `POST /api/cron/fire`) go through the cron scheduler and are governed by cron's own limits, not this cap. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). When the cap is reached, new run-starting requests are rejected with **HTTP 429** `Too many concurrent runs (max N)` — clients should back off and retry.
+
+### Stored history size for `previous_response_id` chaining
+
+Each stored `/v1/responses` snapshot embeds the full cumulative conversation history (that is what `previous_response_id` and `conversation` chaining replay), including every tool output verbatim. A conversation with a few large tool outputs can therefore make a single `response_store.db` write several hundred KB. Set `gateway.api_server.history_tool_output_max_chars` (default **0** = store verbatim) to cap each tool output and each string tool-call argument in the **stored** history at that many characters; anything longer is cut to the head plus a `...[N more chars]` marker. User and assistant text is never touched, and the `response.completed` payload and incremental SSE events are unaffected. Because the stored history is what the model sees on the next chained turn, enabling the cap also trims what the model is replayed — leave it at 0 if your workflow needs complete tool outputs across turns.
 
 ## Security Headers
 

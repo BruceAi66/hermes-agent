@@ -55,6 +55,66 @@ afterEach(() => {
 })
 
 describe('CustomEndpointsSettings', () => {
+  it('sends the chosen API mode and discovered alias metadata on Save (#93622)', async () => {
+    getCustomEndpoints.mockResolvedValue(emptyResponse)
+    validateCustomEndpoint.mockResolvedValue({
+      message: '',
+      model_details: [
+        { id: 'gpt-5.6-sol' },
+        { canonical_model: 'gpt-5.6-sol', id: 'gpt-5.6-sol-high', reasoning_effort: 'high' }
+      ],
+      models: ['gpt-5.6-sol', 'gpt-5.6-sol-high'],
+      ok: true,
+      reachable: true,
+      transport_checked: 'codex_responses'
+    })
+    saveCustomEndpoint.mockResolvedValue(savedResponse)
+    const { CustomEndpointsSettings } = await import('./custom-endpoints-settings')
+
+    render(<CustomEndpointsSettings />)
+
+    await screen.findByText('No custom endpoints')
+    fireEvent.change(screen.getByPlaceholderText('Axet Proxy'), { target: { value: 'Responses gateway' } })
+    fireEvent.change(screen.getByPlaceholderText('http://127.0.0.1:8081/v1'), {
+      target: { value: 'https://responses-gateway.example.com/v1' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Responses API' }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Test' }))
+    })
+    fireEvent.change(screen.getByPlaceholderText('gpt-5.4'), { target: { value: 'gpt-5.6-sol-high' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(validateCustomEndpoint).toHaveBeenCalledWith(expect.objectContaining({ api_mode: 'codex_responses' }))
+    expect(notify).toHaveBeenCalledWith({
+      kind: 'success',
+      message: 'Endpoint is reachable (Responses API route served). Found 2 models.'
+    })
+    expect(saveCustomEndpoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        api_mode: 'codex_responses',
+        model: 'gpt-5.6-sol-high',
+        model_details: expect.arrayContaining([
+          expect.objectContaining({ canonical_model: 'gpt-5.6-sol', id: 'gpt-5.6-sol-high', reasoning_effort: 'high' })
+        ]),
+        models: ['gpt-5.6-sol', 'gpt-5.6-sol-high']
+      })
+    )
+  })
+
+  it('hydrates the API mode from a saved endpoint', async () => {
+    getCustomEndpoints.mockResolvedValue({
+      ...savedResponse,
+      endpoints: [{ ...savedResponse.endpoints[0], api_mode: 'anthropic_messages' }]
+    })
+    const { CustomEndpointsSettings } = await import('./custom-endpoints-settings')
+
+    render(<CustomEndpointsSettings />)
+
+    await screen.findByText('Profile A')
+    expect(screen.getByRole('button', { name: 'Anthropic Messages' }).getAttribute('aria-pressed')).toBe('true')
+  })
+
   it('drops a pending save completion after its profile-scoped view unmounts', async () => {
     let resolveSave!: (value: CustomEndpointsResponse) => void
     saveCustomEndpoint.mockReturnValue(new Promise(resolve => (resolveSave = resolve)))

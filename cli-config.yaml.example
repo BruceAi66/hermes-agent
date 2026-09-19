@@ -154,6 +154,16 @@ model:
   #       CF-Access-Client-Id: "xxxx.access"
   #       CF-Access-Client-Secret: "${CF_ACCESS_SECRET}"
   #       X-Client-Name: "hermes-agent"
+  #
+  # session_affinity_header: NAME of a header that carries Hermes' conversation
+  # id on every request to that provider (all api_modes + auxiliary calls). Off
+  # unless set. For session-aware proxies that otherwise treat each agent-loop
+  # request as a new conversation and replay the whole history upstream.
+  #
+  # providers:
+  #   my-proxy:
+  #     base_url: "http://127.0.0.1:4000/v1"
+  #     session_affinity_header: x-litellm-session-id
 # providers:
 #   meta:
 #     base_url: https://api.meta.ai/v1
@@ -161,6 +171,15 @@ model:
 #     # api_mode auto-detected as codex_responses for api.meta.ai; no need to set
 #     # (the bundled meta-ai provider covers this — a named custom provider is
 #     # only needed for a non-default Meta-compatible endpoint)
+# Fast/priority tier behind an OpenAI-compatible gateway or proxy: agent.service_tier
+# (`/fast`) only reaches first-party endpoints; ask a gateway for its own tier via
+# extra_body, which is merged into every request routed to that provider.
+# providers:
+#   my-gateway:
+#     base_url: https://gateway.example.com/v1
+#     api_key: ${MY_GATEWAY_KEY}
+#     extra_body:
+#       service_tier: priority   # whatever tier value your gateway documents
 # providers:
 #   router:
 #     base_url: https://api.router.com/v1
@@ -690,7 +709,8 @@ compression:
 
   # Native OpenAI Responses server-side compaction (default: false). When true,
   # gpt-5.6-family models on the DIRECT OpenAI API (api.openai.com) or a ChatGPT
-  # Codex subscription compact server-side: OpenAI prunes older context into an
+  # Codex subscription, plus exact gpt-6-astra on official Codex OAuth, compact
+  # server-side: OpenAI prunes older context into an
   # encrypted checkpoint that Hermes replays on later turns. No other provider,
   # route, or model is affected. Hermes' local compression stays armed as the
   # fallback and still handles every non-eligible session.
@@ -1363,6 +1383,7 @@ platform_toolsets:
 #     guest_mode: false
 #     # allowed_chats: ["-1001234567890"]
 #     extra:
+#       drop_pending_on_cold_boot: true # Drop Telegram's queued updates on a cold boot (default). Set false on hosts that power off, so messages sent while offline are delivered on the next start; watcher reconnects always preserve them
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       rich_messages: false          # Bot API 10.1 rich messages (tables/task lists/details/math); default false for copyable legacy MarkdownV2, set true to opt in
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; default false because Telegram Desktop/macOS can visually overlay draft frames

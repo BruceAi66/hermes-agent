@@ -152,6 +152,7 @@ def test_elevenlabs_tts_direct_carries_voice_and_model(voice_home, monkeypatch):
         "tts": {
             "provider": "elevenlabs",
             "elevenlabs": {"voice_id": "voice123", "model_id": "eleven_turbo_v2"},
+            "streaming": {"min_len": 6},
         },
     })
     monkeypatch.setenv("ELEVENLABS_API_KEY", "el_key")
@@ -161,6 +162,8 @@ def test_elevenlabs_tts_direct_carries_voice_and_model(voice_home, monkeypatch):
     assert tts["voice"] == "voice123"
     assert tts["model"] == "eleven_turbo_v2"
     assert "elevenlabs.io" in tts["base_url"]
+    # Desktop client-direct playback cuts sentences with tts.streaming.min_len too (#96927).
+    assert tts["min_len"] == 6
 
 
 def test_command_provider_relays(voice_home, monkeypatch):
@@ -187,6 +190,16 @@ def test_xai_env_key_goes_direct(voice_home, monkeypatch):
     assert stt["mode"] == "direct"
     assert stt["wire"] == "xai-stt"
     assert stt["api_key"] == "xai_key1"
+
+
+def test_direct_stt_carries_the_gateway_transcription_timeout(voice_home, monkeypatch):
+    """The Desktop's direct request must honour ``stt.openai.timeout`` (default 60 s) like the gateway."""
+    voice_home({"stt": {"provider": "xai"}})
+    monkeypatch.setenv("XAI_API_KEY", "xai_key1")
+    assert _resolve()["stt"]["timeout_s"] == 60
+
+    voice_home({"stt": {"provider": "xai", "openai": {"timeout": "5"}}})
+    assert _resolve()["stt"]["timeout_s"] == 5
 
 
 def test_resolution_never_raises(voice_home, monkeypatch):

@@ -49,8 +49,9 @@ class FailoverReason(enum.Enum):
     image_corrupt = "image_corrupt"       # Provider can't decode image bytes — strip and retry (shrinking won't help)
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
-    content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — don't retry unchanged
+    content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
     model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
+    incomplete_response = "incomplete_response"  # Codex/Responses turn stuck emitting reasoning only (no answer, no tool call) after replay + nudge — hand to a different provider
     format_error = "format_error"        # 400 bad request — abort or strip + retry
     role_alternation = "role_alternation"  # Strict chat template rejected adjacent same-role messages — merge them for this destination and retry
     invalid_encrypted_content = "invalid_encrypted_content"  # Responses replay blob rejected — strip replay state and retry
@@ -478,13 +479,16 @@ _REASONING_MANDATORY_PATTERN = "reasoning is mandatory"
 # rejects sampling params for reasoning-first models with the contraction ("This model doesn't
 # support the temperature field", xAI Grok) and inference-profile Claude with "`temperature` is
 # deprecated for this model" (#111043); strict pydantic gateways (Fireworks) name the unknown
-# field as "extra inputs are not permitted" (#109774). Shared with the auxiliary retry ladder
+# field as "extra inputs are not permitted" (#109774). Enum-rejecting aggregators (commandcode.ai)
+# say "Invalid option: expected one of ..." with no "unsupported" anywhere, naming the field only
+# in the structured 'param' tail (#115277). Shared with the auxiliary retry ladder
 # (``agent.auxiliary_client._is_unsupported_parameter_error``).
 UNSUPPORTED_PARAM_MARKERS = (
     "unsupported parameter", "unsupported_parameter", "not supported", "does not support",
     "doesn't support", "is deprecated for this model",
     "unknown parameter", "unrecognized request argument", "unrecognized parameter",
     "invalid parameter", "extra inputs are not permitted",
+    "invalid option: expected one of",
 )
 
 # Reasoning wire-field names (the profile reasoning controls minus ``verbosity``), longest first.
@@ -494,6 +498,16 @@ UNSUPPORTED_PARAM_MARKERS = (
 _REASONING_FIELD_TOKEN = re.compile(
     r"(?<![\w\-/])(?:reasoning_effort|thinking_config|thinking_budget|enable_thinking|thinkingconfig"
     r"|thinkingbudget|reasoning|thinking|think)(?![\w\-/])(?!\s+models?\b)"
+)
+
+# Structured rejection of a reasoning field, read from the stringified body: OpenAI-style
+# ``param`` naming a reasoning field (``reasoning_effort`` on chat, ``reasoning.effort`` on
+# Responses) or an ``invalid_reasoning_effort`` code. Custom Responses relays send this with NO
+# message at all (#100536), so no wording rule can match it — and without a match the message-less
+# 400 fell through to the generic large-session overflow heuristic and started compression.
+_REASONING_PARAM_REJECTION = re.compile(
+    r"""['"]param['"]\s*:\s*['"](?:reasoning(?:[._]effort)?|thinking(?:_config|_budget)?|enable_thinking)['"]"""
+    r"""|invalid_reasoning_effort"""
 )
 
 
@@ -523,13 +537,17 @@ def is_reasoning_field_rejection(error_msg: str) -> bool:
     request argument supplied: reasoning_effort", #112781) or a standalone "unsupported" next to the
     field in either word order ("unsupported reasoning_effort"; "reasoning_effort 'none' unsupported;
     use minimal|low|medium|high|xhigh", #114460). The route default is the right answer for such a
-    model, so both the main loop and the auxiliary ladder retry once without the disable.
+    model, so both the main loop and the auxiliary ladder retry once without the disable. A body
+    whose structured ``param``/code names the reasoning field (``'param': 'reasoning.effort'``,
+    ``invalid_reasoning_effort``, #100536) is a rejection whatever the message says — even none.
 
     Known trade-off: a 400 about a thinking *state* ("Function calling is not supported when
     thinking is enabled") also matches — the marker sits right next to the token, so no proximity
     rule separates it from the forward wordings. Cost is one dropped-disable retry before the
     spent path takes the fallback chain; the auxiliary ladder already treated it this way."""
     msg = (error_msg or "").lower()
+    if _REASONING_PARAM_REJECTION.search(msg):
+        return True
     token = _REASONING_FIELD_TOKEN.search(msg)
     if token is None:
         return False

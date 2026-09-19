@@ -27,6 +27,8 @@ export interface DirectSttConfig {
   api_key: string
   model: null | string
   language: null | string
+  /** Seconds the gateway allows one transcription request (`stt.openai.timeout`); absent on older backends. */
+  timeout_s?: null | number
 }
 
 export interface DirectTtsConfig {
@@ -38,6 +40,8 @@ export interface DirectTtsConfig {
   model: null | string
   voice: null | string
   speed: null | number
+  /** tts.streaming.min_len — shortest first sentence (chars) cut on its own; absent on older backends. */
+  min_len?: null | number
   /** Optional tts.openai fields the server forwards verbatim (lang_code, consent_attestation). */
   extra_body?: Record<string, unknown>
 }
@@ -175,6 +179,38 @@ export function transcriptFromOpenAiMultipartBody(body: string): string {
   return trimmed
 }
 
+const DEFAULT_STT_TIMEOUT_S = 60
+
+/** Same budget the gateway's own transcription client uses (`stt.openai.timeout`, default 60 s). */
+export function sttTimeoutSeconds(stt: Pick<DirectSttConfig, 'timeout_s'>): number {
+  const value = Number(stt.timeout_s)
+
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_STT_TIMEOUT_S
+}
+
+/**
+ * `fetch` with the STT deadline. A slow or wedged endpoint otherwise keeps the
+ * dictation UI in "transcribing" forever — the browser applies no timeout of
+ * its own to a POST that never answers.
+ */
+async function sttFetch(stt: DirectSttConfig, url: string, init: RequestInit): Promise<Response> {
+  const seconds = sttTimeoutSeconds(stt)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), seconds * 1000)
+
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`Transcription timed out after ${seconds}s (${stt.provider} did not answer)`)
+    }
+
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * Transcribe provider-direct. Returns the transcript ('' = silence), or null
  * when the profile's provider isn't client-callable — the caller relays.
@@ -204,7 +240,7 @@ export async function transcribeAudioClientDirect(audio: Blob): Promise<null | s
       form.set('language', stt.language)
     }
 
-    const response = await fetch(`${stt.base_url.replace(/\/+$/, '')}/audio/transcriptions`, {
+    const response = await sttFetch(stt, `${stt.base_url.replace(/\/+$/, '')}/audio/transcriptions`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${stt.api_key}` },
       body: form,
@@ -227,7 +263,7 @@ export async function transcribeAudioClientDirect(audio: Blob): Promise<null | s
       form.set('language', stt.language)
     }
 
-    const response = await fetch(`${stt.base_url.replace(/\/+$/, '')}/stt`, {
+    const response = await sttFetch(stt, `${stt.base_url.replace(/\/+$/, '')}/stt`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${stt.api_key}` },
       body: form,
@@ -255,7 +291,7 @@ export async function transcribeAudioClientDirect(audio: Blob): Promise<null | s
       form.set('language_code', stt.language)
     }
 
-    const response = await fetch(`${stt.base_url.replace(/\/+$/, '')}/speech-to-text`, {
+    const response = await sttFetch(stt, `${stt.base_url.replace(/\/+$/, '')}/speech-to-text`, {
       method: 'POST',
       headers: { 'xi-api-key': stt.api_key },
       body: form,
@@ -350,7 +386,14 @@ export async function synthesizeSpeechClientDirect(tts: DirectTtsConfig, text: s
 const SENTENCE_BOUNDARY_RE = /[.!?…。！？]+["'”’)\]]*\s+/g
 const MIN_SENTENCE_CHARS = 24
 
-export function cutSentences(buffer: string, flush: boolean): { sentences: string[]; rest: string } {
+export function cutSentences(
+  buffer: string,
+  flush: boolean,
+  minSentenceChars?: null | number
+): { sentences: string[]; rest: string } {
+  // tts.streaming.min_len when the backend sends it (a 5–7 char CJK opener is a
+  // whole clause); the historical 24 for older backends without the key.
+  const minChars = minSentenceChars ?? MIN_SENTENCE_CHARS
   const sentences: string[] = []
   let rest = buffer
   let start = 0
@@ -365,7 +408,7 @@ export function cutSentences(buffer: string, flush: boolean): { sentences: strin
 
     // Too-short fragments ("e.g. ", "1. ") stay buffered so we don't fire a
     // provider call per abbreviation — unless a later boundary extends them.
-    if (candidate.length >= MIN_SENTENCE_CHARS) {
+    if (candidate.length >= minChars) {
       sentences.push(candidate)
       start = end
     }
