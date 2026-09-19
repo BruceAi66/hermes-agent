@@ -150,14 +150,36 @@ class MemoryStore:
                 entry["ready"] = True
 
     def _init_db(self) -> None:
-        """Create schema, enable WAL via the shared fallback helper (NFS/SMB/FUSE degrade gracefully), add hrr_vector to pre-HRR DBs."""
+        """Create schema, enable WAL via the shared fallback helper (NFS/SMB/FUSE degrade gracefully), add hrr_vector to
+        pre-HRR DBs, and build the CJK trigram index for stores that predate it."""
         from hermes_state_wal import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
         self._conn.executescript(_SCHEMA)
         if "hrr_vector" not in {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}:
             from hermes_cli.sqlite_util import add_column_if_missing
             add_column_if_missing(self._conn, "facts", "hrr_vector", "hrr_vector BLOB")
+        self._backfill_trigram_index()
         self._conn.commit()
+
+    def _backfill_trigram_index(self) -> None:
+        """Index existing facts once on stores created before the trigram table existed.
+
+        ``facts_fts_trigram`` is an external-content table (``content=facts``), so
+        ``CREATE VIRTUAL TABLE IF NOT EXISTS`` on a pre-existing store leaves the index
+        empty while ``SELECT count(*) FROM facts_fts_trigram`` still reports every fact
+        (it reads the content table). The shadow ``_docsize`` table is the real measure
+        of what is indexed: zero rows there with facts present means no CJK query can
+        ever match — a silent failure for every upgraded store. Rebuild once; stores
+        that were already indexed return immediately, and a missing trigram tokenizer
+        (older SQLite builds) leaves the table absent, which is also a no-op.
+        """
+        try:
+            indexed = self._one("SELECT count(*) FROM facts_fts_trigram_docsize")[0]
+        except sqlite3.OperationalError:  # no trigram tokenizer in this build
+            return
+        if indexed or not self._one("SELECT count(*) FROM facts")[0]:
+            return
+        self._conn.execute("INSERT INTO facts_fts_trigram(facts_fts_trigram) VALUES('rebuild')")
 
     def _one(self, sql: str, params=()):
         return self._conn.execute(sql, params).fetchone()

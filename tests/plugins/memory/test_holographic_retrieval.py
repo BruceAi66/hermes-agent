@@ -325,3 +325,52 @@ def test_window_tokens_matches_or_tokens_latin():
     # Every window appears (quoted) in the MATCH expression
     for w in windows:
         assert f'"{w}"' in match, f"window {w!r} missing from MATCH tokens"
+
+
+def test_legacy_store_backfills_trigram_index(tmp_path):
+    """A store that predates the trigram table must index its facts when reopened.
+
+    ``facts_fts_trigram`` is an external-content table (``content=facts``), so
+    creating it on a store that already holds facts leaves the index empty while
+    ``SELECT count(*)`` on the table still reports every fact. Without the
+    backfill, every CJK query on an upgraded store silently returns nothing.
+    """
+    db_path = tmp_path / "legacy.db"
+    store = MemoryStore(str(db_path))
+    store.add_fact(content="VPS 内存只有 1.9GB，后台常驻进程要控制在两个以内", category="project")
+    # Simulate a pre-patch store: remove the trigram table and its sync triggers.
+    for stmt in (
+        "DROP TRIGGER IF EXISTS facts_trigram_ai",
+        "DROP TRIGGER IF EXISTS facts_trigram_ad",
+        "DROP TRIGGER IF EXISTS facts_trigram_au",
+        "DROP TABLE IF EXISTS facts_fts_trigram",
+    ):
+        store._conn.execute(stmt)
+    store._conn.commit()
+    store.close()
+
+    reopened = MemoryStore(str(db_path))
+    try:
+        indexed = reopened._conn.execute("SELECT count(*) FROM facts_fts_trigram_docsize").fetchone()[0]
+        assert indexed == 1, f"legacy store reopened with an empty trigram index ({indexed} docs indexed)"
+        results = FactRetriever(store=reopened).search("VPS内存多大", limit=5)
+        assert results, "CJK query returned nothing on a store whose index was never built"
+        assert "VPS" in results[0]["content"]
+    finally:
+        reopened.close()
+
+
+def test_backfill_skips_already_indexed_store(tmp_path):
+    """Reopening an indexed store must not rebuild it again."""
+    db_path = tmp_path / "indexed.db"
+    store = MemoryStore(str(db_path))
+    store.add_fact(content="A股数据源以 akshare 为主，iFinD 作兜底", category="project")
+    store.close()
+
+    reopened = MemoryStore(str(db_path))
+    try:
+        indexed = reopened._conn.execute("SELECT count(*) FROM facts_fts_trigram_docsize").fetchone()[0]
+        assert indexed == 1, "backfill must leave an already-built index alone"
+        assert FactRetriever(store=reopened).search("A股数据源", limit=5)
+    finally:
+        reopened.close()
