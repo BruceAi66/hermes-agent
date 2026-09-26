@@ -256,8 +256,27 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[Dict[str, Any]] = Non
             "args": list(rp.get("args") or []), "routed": True,
         }
     except Exception as e:
-        logger.debug("background-review aux routing failed (%s); using main model", e)
+        _warn_review_routing_fallback(agent, task_provider, task_model, e)
         return parent
+
+
+def _warn_review_routing_fallback(agent: Any, task_provider: str, task_model: str, error: Exception) -> None:
+    """The configured review route could not be resolved, so the fork runs on the main model. That
+    was a debug-level line nobody saw (#116055): the misrouted model never ran and nothing said so.
+    User-visible notice once per agent (same rail as the reasoning_effort notice); log every time."""
+    message = (
+        f"⚠ auxiliary.background_review.provider='{task_provider}' (model '{task_model}') could not be "
+        f"resolved: {str(error).splitlines()[0]} — background reviews run on the main model "
+        f"{agent.provider}/{agent.model} instead. Run 'hermes doctor' to check auxiliary routing."
+    )
+    logger.warning("%s", message)
+    if getattr(agent, "_warned_bg_review_routing", False):
+        return
+    agent._warned_bg_review_routing = True
+    emit = getattr(agent, "_emit_warning", None)
+    if callable(emit):
+        with suppress(Exception):
+            emit(message)
 
 
 def _parent_can_emit_tool_calls(agent: Any) -> bool:
@@ -961,6 +980,10 @@ def build_cache_parity_fork(
         _warn_ignored_reasoning_effort(agent, task_cfg)
     review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
+    # Fork-turn log tag: the fork shares the parent's session_id (and model on the
+    # same-model path), so its turn-start/turn-exit log lines are otherwise
+    # indistinguishable from live turns (#118693).
+    review_agent._turn_origin = write_origin
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
     review_agent._user_profile_enabled = agent._user_profile_enabled
@@ -1000,6 +1023,11 @@ def build_cache_parity_fork(
         inherited_scope = resolve_prompt_cache_scope_safe(agent)
         if inherited_scope:
             review_agent._inherited_cache_scope = inherited_scope
+        # Slot-keyed caches (xAI): once the review's OWN compaction rewrites its transcript, its
+        # divergent stream would evict the parent's server slot, so the resolver then derives
+        # ``<scope>::review``. /btw never tags: one prefix-extension call cannot diverge.
+        if write_origin == "background_review":
+            review_agent._prompt_cache_fork_tag = "review"
         # Same reason for the Portal ``conversation=`` tag: with no DB the fork's own
         # _conversation_root_id() falls back to the parent's PHYSICAL id, so after a compression
         # rotation the review's usage was attributed to a different conversation than its parent.
