@@ -13,6 +13,7 @@ from utils import base_url_host_matches, base_url_hostname, base_url_origin
 logger = logging.getLogger(__name__)
 
 _ZERO = Decimal("0")
+_ONE = Decimal("1")
 _ONE_MILLION = Decimal("1000000")
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 # Pay-per-token first-party APIs whose models.dev rate card is the vendor's own
@@ -659,6 +660,43 @@ def normalize_usage(
     )
 
 
+# ── DeepSeek peak/off-peak(LOCAL PATCH)───────────────────────────────────────
+# DeepSeek's published list price doubles inside its peak windows, and the
+# snapshot above carries the OFF-PEAK rates only, so a peak-window request must
+# be priced at 2x or every DeepSeek cost estimate is half the real deduction
+# during Chinese business hours. Peak = 01:00-04:00 and 06:00-10:00 UTC (=
+# Beijing 09:00-12:00 and 14:00-18:00), Monday-Friday; all other hours,
+# weekends and Chinese public holidays are off-peak. Both official pages agree
+# on the windows:
+#   https://api-docs.deepseek.com/quick_start/pricing
+#   https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+# Chinese public holidays are NOT modelled (no calendar available offline), so
+# a holiday request inside a weekday peak window is over-estimated 2x.
+_DEEPSEEK_PEAK_RATE_MULTIPLIER = Decimal("2")
+_DEEPSEEK_PEAK_WINDOWS_UTC_MIN = ((1 * 60, 4 * 60), (6 * 60, 10 * 60))
+_DEEPSEEK_RATE_FIELDS = (
+    "input_cost_per_million", "output_cost_per_million",
+    "cache_read_cost_per_million", "cache_write_cost_per_million",
+    "input_cost_per_million_above", "output_cost_per_million_above",
+    "cache_read_cost_per_million_above", "cache_write_cost_per_million_above",
+    "request_cost",
+)
+
+
+def deepseek_peak_multiplier(now: Optional[datetime] = None) -> Decimal:
+    """``1`` off-peak, ``2`` inside a DeepSeek peak window (table above)."""
+    stamp = now or _UTC_NOW()
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    utc = stamp.astimezone(timezone.utc)
+    if utc.weekday() >= 5:
+        return _ONE
+    minute = utc.hour * 60 + utc.minute
+    return _DEEPSEEK_PEAK_RATE_MULTIPLIER if any(
+        start <= minute < end for start, end in _DEEPSEEK_PEAK_WINDOWS_UTC_MIN
+    ) else _ONE
+
+
 def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
     return CostResult(amount_usd=None, status="unknown", source=source, label="n/a", notes=notes)
 
@@ -691,6 +729,18 @@ def estimate_usage_cost(
     if not entry:
         return _unknown_cost("none")
 
+    # LOCAL PATCH: the DeepSeek snapshot carries off-peak rates; a request that
+    # completes inside a peak window bills at 2x (see deepseek_peak_multiplier).
+    peak_multiplier = _ONE
+    if route.provider == "deepseek" and entry.source == "official_docs_snapshot":
+        peak_multiplier = deepseek_peak_multiplier()
+        if peak_multiplier != _ONE:
+            entry = replace(entry, **{
+                name: (getattr(entry, name) * peak_multiplier
+                       if getattr(entry, name) is not None else None)
+                for name in _DEEPSEEK_RATE_FIELDS
+            })
+
     # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
     # threshold the *_above rates apply to the entire request; None falls back.
     above = entry.tier_threshold_tokens is not None and usage.prompt_tokens > entry.tier_threshold_tokens
@@ -716,6 +766,8 @@ def estimate_usage_cost(
     notes: list[str] = []
     status: CostStatus = "estimated"
     label = format_cost_label(amount)
+    if peak_multiplier != _ONE:
+        notes.append("DeepSeek peak-window rate applied (2x off-peak)")
     if entry.source == "none" and amount == _ZERO:
         status = "included"
         label = "included"
