@@ -51,6 +51,19 @@ class FactRetriever:
     def _atom(self, word: str):
         return hrr.encode_atom(word, self.hrr_dim)
 
+    def _record(self, results: list[dict]) -> list[dict]:
+        """Mark the facts actually handed back to a caller as retrieved (retrieval_count += 1).
+
+        Stats must never break a read, so a store failure here is swallowed — the results are
+        returned either way. Paths that delegate to another recorded method (probe/related falling
+        back to search) must NOT call this again or the same hit is counted twice."""
+        if results:
+            try:
+                self.store.record_retrieval([f["fact_id"] for f in results if f.get("fact_id")])
+            except Exception:
+                pass
+        return results
+
     def _phases(self, blob: bytes):
         return hrr.bytes_to_phases(blob, dim=self.hrr_dim)
 
@@ -87,7 +100,7 @@ class FactRetriever:
         results = sorted(candidates, key=lambda x: x["score"], reverse=True)[:limit]
         for fact in results:
             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
-        return results
+        return self._record(results)
 
     def _vector_query(self, fallback: str, category: str | None, limit: int, sim_fn: Callable) -> list[dict]:
         """Rank every fact vector (optionally per category) by sim_fn; FTS5 fallback when no vectors exist."""
@@ -152,7 +165,7 @@ class FactRetriever:
         """关于某实体的全部事实(关系表精确命中)。无关系命中时回退 FTS 关键词检索。"""
         hits = self._relation_rows([entity], category=category)
         if hits:
-            return self._rank_relation_hits(hits, [entity], limit)
+            return self._record(self._rank_relation_hits(hits, [entity], limit))
         return self.search(entity, category=category, limit=limit)
 
     def related(self, entity: str, category: str | None = None, limit: int = 10) -> list[dict]:
@@ -165,7 +178,7 @@ class FactRetriever:
         if not co_names:
             return []
         rows = self._relation_rows(co_names, category=category, require_all=False, exclude_ids=own_ids)
-        return self._rank_relation_hits(rows, co_names, limit) if rows else []
+        return self._record(self._rank_relation_hits(rows, co_names, limit)) if rows else []
 
     def reason(self, entities: list[str], category: str | None = None, limit: int = 10) -> list[dict]:
         """同时连接多个实体的事实(关系表 AND 语义)。没有任何事实同时命中全部实体时返回空列表
@@ -173,7 +186,7 @@ class FactRetriever:
         if not entities:
             return []
         hits = self._relation_rows(entities, category=category, require_all=True)
-        return self._rank_relation_hits(hits, entities, limit) if hits else []
+        return self._record(self._rank_relation_hits(hits, entities, limit)) if hits else []
 
     def contradict(self, category: str | None = None, threshold: float = 0.3, limit: int = 10) -> list[dict]:
         """Pairs of facts sharing entities (same subject) with low content-vector similarity (different claims). Empty without numpy."""

@@ -104,9 +104,25 @@ _HELPFUL_DELTA, _UNHELPFUL_DELTA = 0.05, -0.10
 _RE_SINGLE_ENTITY = (re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'), re.compile(r'"([^"]+)"'), re.compile(r"'([^']+)'"))
 _RE_AKA = re.compile(r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)', re.IGNORECASE)
 _ENTITY_NAMES_SQL = "SELECT e.name FROM entities e JOIN fact_entities fe ON fe.entity_id = e.entity_id WHERE fe.fact_id = ?"
+_ENTITY_ALL_SQL = "SELECT name FROM entities"
 # Entity lookup order: exact name, then aliases (comma-separated; wrapped in commas for whole-alias matching).
 _ENTITY_LOOKUPS = ("SELECT entity_id FROM entities WHERE name LIKE ?",
                    "SELECT entity_id FROM entities WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%'")
+# Auto-linking threshold (2026-10-12 patch): a known entity is re-linked to a new fact when it is
+# mentioned in the content AND looks substantive — referenced by >=2 facts already, or a name long
+# enough to be specific on its own. Without it, one-off extraction noise ("继续", "X", "哪个能试")
+# would spread across the store; with it, real entities densify the relation graph.
+_KNOWN_ENTITY_MIN_LINKS, _KNOWN_ENTITY_MIN_LEN = 2, 4
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _mentions(text: str, name: str) -> bool:
+    """Case-insensitive mention test. CJK names match as plain substrings (Chinese has no word
+    boundaries); ASCII names need non-alphanumeric boundaries so "Mac" does not hit "macOS"."""
+    low, needle = text.lower(), name.lower()
+    if _CJK.search(name):
+        return needle in low
+    return re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])", low) is not None
 
 
 def _clamp_trust(value: float) -> float:
@@ -263,11 +279,102 @@ class MemoryStore:
             uniq.setdefault(name.lower(), name)
         return list(uniq.values())
 
-    def _link_entities(self, fact_id: int, content: str) -> None:
-        """Extract entities from content, resolve/create them, and link each to the fact."""
-        for name in self._extract_entities(content):
+    def _link_entities(self, fact_id: int, content: str, eligible: "frozenset[str] | None" = None) -> None:
+        """Extract entities from content, resolve/create them, and link each to the fact.
+
+        Two sources are unioned (2026-10-12 patch): the regex patterns in ``_extract_entities``
+        (capitalised English phrases, quoted terms, "X aka Y") and — because Chinese facts rarely
+        carry quoted names — the names of substantive entities already in the store that appear in
+        ``content``. Without the second source a fact mentioning a known entity never joins the
+        relation graph and stays invisible to probe/related/reason (45% of facts were unreachable
+        when this was added).
+
+        ``eligible`` pins the second source to a pre-computed name set. A bulk backfill must pass
+        it: eligibility is link-count based, so letting it drift mid-pass lets one noisy name
+        self-reinforce across the whole store ("继续" jumped 1 -> 4 links that way)."""
+        names = self._extract_entities(content)
+        seen = {n.lower() for n in names}
+        for name in self._known_entity_mentions(content, eligible=eligible):
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                names.append(name)
+        for name in names:
             self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
                         (fact_id, self._resolve_entity(name)))
+
+    def _eligible_entity_names(self) -> frozenset[str]:
+        """Names substantive enough to auto-link (see the _KNOWN_ENTITY_* thresholds)."""
+        rows = self._conn.execute(
+            "SELECT e.name AS name, (SELECT COUNT(*) FROM fact_entities fe "
+            "WHERE fe.entity_id = e.entity_id) AS n FROM entities e").fetchall()
+        return frozenset(r["name"] for r in rows
+                         if r["name"] and len(r["name"]) >= 2
+                         and (r["n"] >= _KNOWN_ENTITY_MIN_LINKS or len(r["name"]) >= _KNOWN_ENTITY_MIN_LEN))
+
+    def _known_entity_mentions(self, content: str, eligible: "frozenset[str] | None" = None) -> list[str]:
+        """Substantive entities already stored that are mentioned in ``content``."""
+        names = self._eligible_entity_names() if eligible is None else eligible
+        return [n for n in names if _mentions(content, n)]
+
+    def link_entity(self, fact_id: int, name: str) -> bool:
+        """Link an explicit entity name to a fact, creating the entity when absent; returns True if
+        a new link row was inserted (2026-10-12 pile-on API).
+
+        Needed because ``_link_entities`` can only see what the text contains or already knows: a
+        fact whose subject appears nowhere in its wording (or only as a paraphrase) can never be
+        reached by the extractor, yet a human/agent knows exactly what it is about. Curation code
+        uses this to state that relation directly instead of rewording stored content."""
+        name = (name or "").strip()
+        if not name:
+            return False
+        with self._lock:
+            if self._one("SELECT 1 FROM facts WHERE fact_id = ?", (fact_id,)) is None:
+                return False
+            entity_id = self._resolve_entity(name)
+            known = self._one("SELECT COUNT(*) AS n FROM fact_entities WHERE fact_id = ? AND entity_id = ?",
+                              (fact_id, entity_id))
+            self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                        (fact_id, entity_id))
+            return int(known["n"]) == 0
+
+    def record_retrieval(self, fact_ids: "list[int] | tuple[int, ...] | set[int]") -> int:
+        """Increment ``retrieval_count`` for the facts a retrieval actually returned; returns rows
+        updated (2026-10-12 patch: the column was schema-only — no code path ever wrote it).
+
+        Deliberately does NOT touch ``updated_at``: temporal decay reads that column, and "last
+        read" must not be mistaken for "recently learned". Statistics must never break a read, so
+        this runs under the store lock only for the ids handed in."""
+        ids = sorted({int(i) for i in fact_ids})
+        if not ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids)
+            cur = self._write(
+                f"UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN ({placeholders})",
+                ids)
+            return cur.rowcount if cur.rowcount is not None else 0
+
+    def relink_all_entities(self, drop_orphan_entities: bool = True) -> dict:
+        """Maintenance backfill: re-run entity linking for every fact (idempotent via INSERT OR
+        IGNORE) so the improved linker reaches facts written before it existed. With
+        ``drop_orphan_entities``, entities that still have no links are deleted — they can only be
+        extraction noise and would otherwise keep matching future content. Returns counters."""
+        with self._lock:
+            rows = self._conn.execute("SELECT fact_id, content FROM facts").fetchall()
+            eligible = self._eligible_entity_names()  # snapshot: see _link_entities' note on drift
+            before = int(self._one("SELECT COUNT(*) AS n FROM fact_entities")["n"])
+            for row in rows:
+                self._link_entities(int(row["fact_id"]), row["content"], eligible=eligible)
+            after = int(self._one("SELECT COUNT(*) AS n FROM fact_entities")["n"])
+            orphans = 0
+            if drop_orphan_entities:
+                orphans = int(self._one(
+                    "SELECT COUNT(*) AS n FROM entities e WHERE NOT EXISTS "
+                    "(SELECT 1 FROM fact_entities fe WHERE fe.entity_id = e.entity_id)")["n"])
+                self._write("DELETE FROM entities WHERE NOT EXISTS "
+                            "(SELECT 1 FROM fact_entities fe WHERE fe.entity_id = entities.entity_id)")
+            return {"facts": len(rows), "new_links": after - before, "total_links": after,
+                    "orphans_dropped": orphans}
 
     def _resolve_entity(self, name: str) -> int:
         """Return the entity_id for a case-insensitive name or alias match, creating the entity if absent."""
